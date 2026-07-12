@@ -1,0 +1,3 @@
+import { describe, expect, it } from 'vitest';
+import { ageOn, BasicAgeVerificationProvider } from './age-verification.js';
+describe('verificação de idade',()=>{it('calcula idade antes do aniversário',()=>expect(ageOn(new Date('2008-12-20'),new Date('2026-07-12'))).toBe(17));it('impede menor de idade',async()=>expect(await new BasicAgeVerificationProvider().verify({birthDate:new Date('2010-01-01'),adultDeclaration:true,emailVerified:true})).toMatchObject({approved:false}));it('exige e-mail confirmado',async()=>expect(await new BasicAgeVerificationProvider().verify({birthDate:new Date('1990-01-01'),adultDeclaration:true,emailVerified:false})).toMatchObject({approved:false}))});

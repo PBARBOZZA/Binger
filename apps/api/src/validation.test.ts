@@ -1,0 +1,2 @@
+import { describe, expect, it } from 'vitest'; import { validateMessage } from './api-routes.js';
+describe('mensagens',()=>{it('impede vazia',()=>expect(validateMessage({content:'  '})).toHaveProperty('error'));it('impede longa',()=>expect(validateMessage({content:'a'.repeat(501)})).toHaveProperty('error'));it('remove HTML e impede links',()=>{expect(validateMessage({content:'<script>alert(1)</script>'})).toEqual({content:'scriptalert(1)/script'});expect(validateMessage({content:'acesse https://example.com'})).toHaveProperty('error')})});

@@ -1,0 +1,227 @@
+generator client {
+  provider = "prisma-client-js"
+}
+datasource db {
+  provider = "postgresql"
+  url = env("DATABASE_URL")
+}
+
+enum Role {
+  USER
+  MODERATOR
+  ADMIN
+}
+enum UserStatus {
+  ACTIVE
+  SUSPENDED
+  BANNED
+  DELETED
+}
+enum InvitationPreference {
+  ALL
+  VERIFIED_ONLY
+  NONE
+}
+enum ConversationStatus {
+  PENDING
+  ACCEPTED
+  REJECTED
+  CLOSED
+}
+enum ReportStatus {
+  OPEN
+  REVIEWING
+  RESOLVED
+  DISMISSED
+}
+enum ReportPriority {
+  NORMAL
+  HIGH
+  CRITICAL
+}
+enum ModerationStatus {
+  VISIBLE
+  HIDDEN
+  UNDER_REVIEW
+}
+
+model User {
+  id String @id @default(cuid())
+  email String @unique
+  passwordHash String
+  birthDate DateTime
+  emailVerifiedAt DateTime?
+  ageVerifiedAt DateTime?
+  role Role @default(USER)
+  status UserStatus @default(ACTIVE)
+  sessionVersion Int @default(1)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  deletedAt DateTime?
+  profile UserProfile?
+  sessions Session[]
+  terms TermsAcceptance[]
+  roomMessages RoomMessage[]
+  privateMessages PrivateMessage[]
+  conversationsCreated PrivateConversation[] @relation("CreatedBy")
+  conversationsInvited PrivateConversation[] @relation("InvitedUser")
+  reportsMade Report[] @relation("Reporter")
+  reportsReceived Report[] @relation("Reported")
+  reportsReviewed Report[] @relation("Reviewer")
+  blocksMade Block[] @relation("Blocker")
+  blocksReceived Block[] @relation("Blocked")
+  auditActions AuditLog[]
+}
+
+model City {
+  id String @id @default(cuid())
+  name String
+  state String
+  slug String @unique
+  active Boolean @default(true)
+  createdAt DateTime @default(now())
+  rooms Room[]
+  profiles UserProfile[]
+}
+
+model Room {
+  id String @id @default(cuid())
+  cityId String
+  city City @relation(fields: [cityId], references: [id])
+  name String
+  slug String
+  active Boolean @default(true)
+  createdAt DateTime @default(now())
+  messages RoomMessage[]
+  @@unique([cityId, slug])
+}
+
+model UserProfile {
+  id String @id @default(cuid())
+  userId String @unique
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  cityId String
+  city City @relation(fields: [cityId], references: [id])
+  nickname String
+  ageRange String
+  interests String[]
+  statusMessage String?
+  invitationPreference InvitationPreference @default(ALL)
+  nicknameChangedAt DateTime?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model RoomMessage {
+  id String @id @default(cuid())
+  roomId String
+  room Room @relation(fields: [roomId], references: [id])
+  userId String
+  user User @relation(fields: [userId], references: [id])
+  content String
+  createdAt DateTime @default(now())
+  deletedAt DateTime?
+  moderationStatus ModerationStatus @default(VISIBLE)
+  reports Report[]
+  @@index([roomId, createdAt])
+}
+
+model PrivateConversation {
+  id String @id @default(cuid())
+  createdById String
+  createdBy User @relation("CreatedBy", fields: [createdById], references: [id])
+  invitedUserId String
+  invitedUser User @relation("InvitedUser", fields: [invitedUserId], references: [id])
+  status ConversationStatus @default(PENDING)
+  acceptedAt DateTime?
+  closedAt DateTime?
+  createdAt DateTime @default(now())
+  messages PrivateMessage[]
+}
+
+model PrivateMessage {
+  id String @id @default(cuid())
+  conversationId String
+  conversation PrivateConversation @relation(fields: [conversationId], references: [id])
+  senderId String
+  sender User @relation(fields: [senderId], references: [id])
+  content String
+  createdAt DateTime @default(now())
+  deletedAt DateTime?
+  moderationStatus ModerationStatus @default(VISIBLE)
+  reports Report[]
+}
+
+model Report {
+  id String @id @default(cuid())
+  reporterId String
+  reporter User @relation("Reporter", fields: [reporterId], references: [id])
+  reportedUserId String
+  reportedUser User @relation("Reported", fields: [reportedUserId], references: [id])
+  roomMessageId String?
+  roomMessage RoomMessage? @relation(fields: [roomMessageId], references: [id])
+  privateMessageId String?
+  privateMessage PrivateMessage? @relation(fields: [privateMessageId], references: [id])
+  reason String
+  description String?
+  priority ReportPriority @default(NORMAL)
+  status ReportStatus @default(OPEN)
+  createdAt DateTime @default(now())
+  reviewedAt DateTime?
+  reviewedById String?
+  reviewedBy User? @relation("Reviewer", fields: [reviewedById], references: [id])
+}
+
+model Block {
+  id String @id @default(cuid())
+  blockerId String
+  blocker User @relation("Blocker", fields: [blockerId], references: [id])
+  blockedUserId String
+  blocked User @relation("Blocked", fields: [blockedUserId], references: [id])
+  createdAt DateTime @default(now())
+  @@unique([blockerId, blockedUserId])
+}
+
+model Session {
+  id String @id @default(cuid())
+  userId String
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash String @unique
+  ipHash String
+  userAgent String?
+  expiresAt DateTime
+  revokedAt DateTime?
+  createdAt DateTime @default(now())
+}
+
+model TermsAcceptance {
+  id String @id @default(cuid())
+  userId String
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  documentType String
+  documentVersion String
+  acceptedAt DateTime @default(now())
+  ipHash String
+}
+
+model AuditLog {
+  id String @id @default(cuid())
+  actorUserId String?
+  actorUser User? @relation(fields: [actorUserId], references: [id])
+  action String
+  targetType String
+  targetId String
+  metadata Json
+  createdAt DateTime @default(now())
+  @@index([createdAt])
+}
+
+model EmailToken {
+  id String @id @default(cuid())
+  userId String
+  purpose String
+  tokenHash String @unique
+  expiresAt DateTime
+  usedAt DateTime?
+  createdAt DateTime @default(now())
+}
