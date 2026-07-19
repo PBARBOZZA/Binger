@@ -46,7 +46,17 @@ authRouter.post('/login', async (req, res) => {
   if (!parsed.success) return res.status(400).json({ error: 'Credenciais inválidas.' });
   const user = await prisma.user.findUnique({ where: { email: parsed.data.email.toLowerCase() } });
   if (!user || !(await argon2.verify(user.passwordHash, parsed.data.password))) return res.status(401).json({ error: 'E-mail ou senha incorretos.' });
-  if (!user.emailVerifiedAt || !user.ageVerifiedAt) return res.status(403).json({ error: 'Confirme o e-mail antes de entrar.' });
+  if (!user.emailVerifiedAt) {
+    return res.status(403).json({
+      error: 'Confirme o e-mail antes de entrar.'
+    });
+  }
+
+  if (!user.ageVerifiedAt) {
+    return res.status(403).json({
+      error: 'Confirme sua maioridade antes de entrar.'
+    });
+  }
   const token = randomToken();
   await prisma.session.create({ data: { userId: user.id, tokenHash: hash(token), ipHash: ipHash(req.ip ?? ''), userAgent: req.get('user-agent'), expiresAt: new Date(Date.now() + cookieOptions.maxAge) } });
   res.cookie(SESSION_COOKIE, token, cookieOptions).json({ user: { id: user.id, email: user.email, role: user.role, profileComplete: Boolean(await prisma.userProfile.findUnique({ where: { userId: user.id } })) } });

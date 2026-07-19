@@ -5,3 +5,7 @@ coverage
 *.log
 .DS_Store
 apps/api/prisma/dev.db
+
+# Arquivos privados e gerados
+apps/web/.env.production
+*.tsbuildinfo
