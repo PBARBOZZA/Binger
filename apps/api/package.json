@@ -8,6 +8,7 @@
     "build": "prisma generate && tsc -p tsconfig.json",
     "start": "node dist/index.js",
     "test": "prisma generate && vitest run",
+    "lint": "tsc -p tsconfig.json --noEmit",
     "db:migrate": "prisma migrate dev",
     "db:deploy": "prisma migrate deploy",
     "db:seed": "prisma db seed"

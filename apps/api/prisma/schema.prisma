@@ -28,6 +28,10 @@ enum ConversationStatus {
   REJECTED
   CLOSED
 }
+enum MessageScope {
+  PUBLIC
+  RESERVED
+}
 enum ReportStatus {
   OPEN
   REVIEWING
@@ -61,15 +65,19 @@ model User {
   profile UserProfile?
   sessions Session[]
   terms TermsAcceptance[]
-  roomMessages RoomMessage[]
+  roomMessages RoomMessage[] @relation("RoomMessageSender")
+  reservedMessages RoomMessage[] @relation("RoomMessageRecipient")
   privateMessages PrivateMessage[]
-  conversationsCreated PrivateConversation[] @relation("CreatedBy")
-  conversationsInvited PrivateConversation[] @relation("InvitedUser")
+  conversationsAsOne PrivateConversation[] @relation("ParticipantOne")
+  conversationsAsTwo PrivateConversation[] @relation("ParticipantTwo")
+  conversationsRequested PrivateConversation[] @relation("RequestedBy")
   reportsMade Report[] @relation("Reporter")
   reportsReceived Report[] @relation("Reported")
   reportsReviewed Report[] @relation("Reviewer")
-  blocksMade Block[] @relation("Blocker")
-  blocksReceived Block[] @relation("Blocked")
+  blocksMade UserBlock[] @relation("Blocker")
+  blocksReceived UserBlock[] @relation("Blocked")
+  mutesMade UserMute[] @relation("Muter")
+  mutesReceived UserMute[] @relation("Muted")
   auditActions AuditLog[]
 }
 
@@ -117,26 +125,34 @@ model RoomMessage {
   roomId String
   room Room @relation(fields: [roomId], references: [id])
   userId String
-  user User @relation(fields: [userId], references: [id])
+  user User @relation("RoomMessageSender", fields: [userId], references: [id])
+  recipientId String?
+  recipient User? @relation("RoomMessageRecipient", fields: [recipientId], references: [id])
+  scope MessageScope @default(PUBLIC)
   content String
   createdAt DateTime @default(now())
   deletedAt DateTime?
   moderationStatus ModerationStatus @default(VISIBLE)
   reports Report[]
   @@index([roomId, createdAt])
+  @@index([recipientId, createdAt])
 }
 
 model PrivateConversation {
   id String @id @default(cuid())
-  createdById String
-  createdBy User @relation("CreatedBy", fields: [createdById], references: [id])
-  invitedUserId String
-  invitedUser User @relation("InvitedUser", fields: [invitedUserId], references: [id])
+  participantOneId String
+  participantOne User @relation("ParticipantOne", fields: [participantOneId], references: [id])
+  participantTwoId String
+  participantTwo User @relation("ParticipantTwo", fields: [participantTwoId], references: [id])
+  requestedById String
+  requestedBy User @relation("RequestedBy", fields: [requestedById], references: [id])
   status ConversationStatus @default(PENDING)
   acceptedAt DateTime?
   closedAt DateTime?
   createdAt DateTime @default(now())
   messages PrivateMessage[]
+  @@index([participantOneId, status])
+  @@index([participantTwoId, status])
 }
 
 model PrivateMessage {
@@ -147,9 +163,12 @@ model PrivateMessage {
   sender User @relation(fields: [senderId], references: [id])
   content String
   createdAt DateTime @default(now())
+  readAt DateTime?
   deletedAt DateTime?
   moderationStatus ModerationStatus @default(VISIBLE)
   reports Report[]
+  @@index([conversationId, createdAt])
+  @@index([senderId, readAt])
 }
 
 model Report {
@@ -172,7 +191,7 @@ model Report {
   reviewedBy User? @relation("Reviewer", fields: [reviewedById], references: [id])
 }
 
-model Block {
+model UserBlock {
   id String @id @default(cuid())
   blockerId String
   blocker User @relation("Blocker", fields: [blockerId], references: [id])
@@ -180,6 +199,20 @@ model Block {
   blocked User @relation("Blocked", fields: [blockedUserId], references: [id])
   createdAt DateTime @default(now())
   @@unique([blockerId, blockedUserId])
+  @@index([blockedUserId])
+  @@map("user_blocks")
+}
+
+model UserMute {
+  id String @id @default(cuid())
+  muterId String
+  muter User @relation("Muter", fields: [muterId], references: [id], onDelete: Cascade)
+  mutedUserId String
+  muted User @relation("Muted", fields: [mutedUserId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
+  @@unique([muterId, mutedUserId])
+  @@index([mutedUserId])
+  @@map("user_mutes")
 }
 
 model Session {
