@@ -8,3 +8,43 @@
 .mobile-nav-head{display:contents}
 @media(max-width:850px){.rooms{display:flex;position:fixed;z-index:20;left:0;top:0;bottom:0;width:min(300px,88vw);transform:translateX(-105%);transition:.2s;box-shadow:20px 0 40px #0008}.rooms.open{transform:none}.mobile-nav-head{display:flex;align-items:center;justify-content:space-between}}
 @media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important;transition:none!important}}
+/* ===== Ajuste para notebooks e telas intermediárias ===== */
+@media (min-width: 851px) and (max-width: 1366px) {
+  .chat {
+    grid-template-columns: 210px minmax(0, 1fr) 230px;
+  }
+
+  .rooms,
+  .participants {
+    padding: 16px;
+  }
+
+  .messages > header {
+    padding-left: 16px;
+    padding-right: 16px;
+  }
+
+  .stream {
+    padding-left: 18px;
+    padding-right: 18px;
+  }
+
+  .composer {
+    padding-left: 14px;
+    padding-right: 14px;
+  }
+
+  .room {
+    padding-left: 8px;
+    padding-right: 8px;
+  }
+
+  .conversation {
+    grid-template-columns: 34px minmax(0, 1fr) auto;
+    gap: 8px;
+  }
+
+  .participants {
+    font-size: 14px;
+  }
+}
