@@ -5,6 +5,11 @@ export const registerSchema = z.object({
   birthDate: z.coerce.date(), adultDeclaration: z.literal(true), acceptTerms: z.literal(true), acceptPrivacy: z.literal(true)
 });
 export const loginSchema = z.object({ email: z.string().email(), password: z.string().min(1) });
+export const forgotPasswordSchema = z.object({ email: z.string().email().max(254) });
+export const resetPasswordSchema = z.object({
+  token: z.string().min(32).max(256),
+  password: z.string().min(10).max(128)
+});
 export const profileSchema = z.object({
   cityId: z.string().cuid(), nickname: z.string().trim().min(3).max(24)
     .regex(/^[\p{L}\p{N}_ -]+$/u, 'Use letras, números, espaço, hífen ou sublinhado.'),

@@ -8,6 +8,12 @@ export const hash = (value: string, secret = config.SESSION_SECRET) =>
   crypto.createHmac('sha256', secret).update(value).digest('hex');
 export const randomToken = () => crypto.randomBytes(32).toString('base64url');
 export const ipHash = (ip: string) => hash(ip, config.IP_HASH_SECRET);
+export const emailTokenHash = (value: string) => hash(value, config.EMAIL_TOKEN_SECRET ?? config.SESSION_SECRET);
+export const emailTokenHashCandidates = (value: string) => {
+  const current = emailTokenHash(value);
+  const legacy = hash(value);
+  return current === legacy ? [current] : [current, legacy];
+};
 export const cleanText = (value: string) => value.replace(/[<>]/g, '').replace(/\p{C}/gu, '').trim();
 export const hasUrl = (value: string) => /(?:https?:\/\/|www\.|\b[a-z0-9-]+\.(?:com|net|org|br)\b)/i.test(value);
 

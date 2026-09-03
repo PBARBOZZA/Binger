@@ -8,6 +8,7 @@
 .mobile-nav-head{display:contents}
 @media(max-width:850px){.rooms{display:flex;position:fixed;z-index:20;left:0;top:0;bottom:0;width:min(300px,88vw);transform:translateX(-105%);transition:.2s;box-shadow:20px 0 40px #0008}.rooms.open{transform:none}.mobile-nav-head{display:flex;align-items:center;justify-content:space-between}}
 @media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important;transition:none!important}}
+.switch-link{display:flex;align-items:center;justify-content:center}.auth-links{margin-top:20px;text-align:center}.auth-links a{color:#dc5b89}
 /* ===== Ajuste para notebooks e telas intermediárias ===== */
 @media (min-width: 851px) and (max-width: 2000px)  {
   .chat {

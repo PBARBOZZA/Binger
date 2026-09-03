@@ -21,7 +21,7 @@ MVP de uma praça digital regional anônima, exclusiva para maiores de 18 anos. 
 6. Em terminais separados: `npm run dev --workspace @binger/api` e `npm run dev --workspace @binger/web`.
 7. Abra `http://localhost:5173`.
 
-Em desenvolvimento, `DEV_EXPOSE_EMAIL_TOKENS=true` devolve o token de confirmação na resposta. Isso deve ser `false` em produção e substituído por envio transacional.
+O cadastro e a recuperação de senha usam o mesmo transporte SMTP e remetente. As variáveis necessárias estão documentadas em `.env.example`; `DEV_EXPOSE_EMAIL_TOKENS` permanece desativado por padrão. Mesmo quando essa opção é habilitada localmente, ela se aplica somente à confirmação do cadastro: tokens de recuperação nunca são devolvidos pela API nem escritos em logs.
 
 ## Docker Compose
 
@@ -33,24 +33,24 @@ Use DNS e Caddy/Nginx na frente dos containers, TLS automático, `WEB_ORIGIN` e 
 
 ## Segurança e retenção
 
-Implementado: Argon2id, sessão opaca armazenada como hash, cookie HttpOnly/SameSite/Secure em produção, revogação, CORS restrito, Helmet, limites de corpo e requisições, texto puro, bloqueio de URLs, autorização REST/WebSocket, minimização de IP por HMAC, auditoria administrativa e prioridade crítica para suspeita de menor.
+Implementado: Argon2id, sessão opaca armazenada como hash, cookie HttpOnly/SameSite/Secure em produção, revogação, recuperação de senha por token opaco de uso único, CORS restrito, Helmet, limites de corpo e requisições, texto puro, bloqueio de URLs, autorização REST/WebSocket, minimização de IP por HMAC, auditoria administrativa e prioridade crítica para suspeita de menor.
 
-Riscos ainda abertos antes de operação pública: serviço de e-mail real; recuperação/alteração de senha; CSRF token dedicado para navegadores legados; rate limit distribuído e antifraude; verificação etária externa; moderação operacional 24/7; política jurídica de retenção/LGPD revisada; exportação/exclusão automatizadas; backup restaurado em ensaio; WAF; observabilidade; testes de invasão; mensagens privadas completas e UI de moderação. O MVP não oferece criptografia ponta a ponta.
+Riscos ainda abertos antes de operação pública: provedor SMTP transacional e monitoramento de entrega; CSRF token dedicado para navegadores legados; rate limit distribuído e antifraude; verificação etária externa; moderação operacional 24/7; política jurídica de retenção/LGPD revisada; exportação/exclusão automatizadas; backup restaurado em ensaio; WAF; observabilidade; testes de invasão; mensagens privadas completas e UI de moderação. O MVP não oferece criptografia ponta a ponta.
 
 ## Próxima versão
 
-Redis para presença e limites, fila de e-mail, recuperação de senha, exportação/exclusão LGPD, preferências de convite, conversa privada completa, ferramentas de moderação, exclusão curta auditada, paginação por cursor, notificações opt-in e provedor externo de maioridade.
+Redis para presença e limites, fila durável de e-mail, exportação/exclusão LGPD, preferências de convite, conversa privada completa, ferramentas de moderação, exclusão curta auditada, paginação por cursor, notificações opt-in e provedor externo de maioridade.
 
 ## Testes e validação
 
-- `npm test`: regras unitárias de idade e conteúdo.
+- `npm test`: regras unitárias de idade, conteúdo, validação de senha e sanitização de diagnósticos de e-mail.
 - `npm run build`: TypeScript e builds de produção.
 - Fluxos com banco devem ser cobertos por integração em ambiente PostgreSQL isolado antes do lançamento.
 
 ## Checklist de implantação
 
 - [ ] Todos os segredos e credenciais foram rotacionados.
-- [ ] `DEV_EXPOSE_EMAIL_TOKENS=false` e e-mail transacional configurado.
+- [ ] Entrega transacional de e-mail validada no ambiente de produção.
 - [ ] HTTPS, cookies Secure, CORS e CSP apontam somente ao domínio final.
 - [ ] Migrations e seed executados; administrador acessível e senha trocada.
 - [ ] Backup e restauração testados.
