@@ -48,3 +48,20 @@
     font-size: 14px;
   }
 }
+@media (min-width: 851px) {
+  .chat {
+    height: 100dvh;
+    min-height: 0;
+    overflow: hidden;
+  }
+
+  .messages {
+    min-height: 0;
+    overflow: hidden;
+  }
+
+  .stream {
+    min-height: 0;
+    overflow-y: auto;
+  }
+}
