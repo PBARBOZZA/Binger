@@ -6,6 +6,7 @@ export const registerSchema = z.object({
 });
 export const loginSchema = z.object({ email: z.string().email(), password: z.string().min(1) });
 export const forgotPasswordSchema = z.object({ email: z.string().email().max(254) });
+export const resendVerificationSchema = z.object({ email: z.string().email().max(254) });
 export const resetPasswordSchema = z.object({
   token: z.string().min(32).max(256),
   password: z.string().min(10).max(128)

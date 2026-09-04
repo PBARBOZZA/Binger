@@ -5,14 +5,22 @@ import { ageOn, ageVerificationProvider } from './age-verification.js';
 import { prisma } from './db.js';
 import { config } from './config.js';
 import { cookieOptions, emailTokenHash, emailTokenHashCandidates, hash, ipHash, randomToken, requireAuth, SESSION_COOKIE } from './security.js';
-import { forgotPasswordSchema, loginSchema, profileSchema, registerSchema, resetPasswordSchema } from './validation.js';
+import { forgotPasswordSchema, loginSchema, profileSchema, registerSchema, resendVerificationSchema, resetPasswordSchema } from './validation.js';
 import { isEmailDeliveryConfigured, sendPasswordResetEmail, sendVerificationEmail } from './mailer.js';
 import { logEmailFailure } from './email-diagnostics.js';
 import { passwordResetCompletedResponse, passwordResetRequestResponse } from './password-reset-policy.js';
+import { verificationResendPolicy, verificationResendResponse } from './email-verification-policy.js';
 
 export const authRouter = Router();
 const termsVersion = '2026-07-12';
 const resetRequestLimiter = rateLimit({ windowMs: 15 * 60_000, limit: 5, standardHeaders: 'draft-7', legacyHeaders: false });
+const verificationResendLimiter = rateLimit({
+  windowMs: verificationResendPolicy.requestWindowMs,
+  limit: verificationResendPolicy.requestLimit,
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+  handler: (_req, res) => res.status(202).json(verificationResendResponse())
+});
 
 async function waitForMinimumResponseTime(startedAt: number) {
   const remaining = 500 - (Date.now() - startedAt);
@@ -56,6 +64,65 @@ authRouter.post('/verify-email', async (req, res) => {
     prisma.user.update({ where: { id: user.id }, data: { emailVerifiedAt: new Date(), ageVerifiedAt: new Date() } })
   ]);
   res.json({ message: 'E-mail e maioridade confirmados.' });
+});
+
+authRouter.post('/resend-verification', verificationResendLimiter, async (req, res) => {
+  const startedAt = Date.now();
+  const parsed = resendVerificationSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: 'Informe um e-mail válido.' });
+
+  const user = await prisma.user.findFirst({
+    where: {
+      email: parsed.data.email.toLowerCase(),
+      status: 'ACTIVE',
+      deletedAt: null,
+      emailVerifiedAt: null
+    },
+    select: { id: true, email: true }
+  });
+
+  if (user && isEmailDeliveryConfigured()) {
+    const token = randomToken();
+    const record = await prisma.$transaction(async tx => {
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`verification-resend:${user.id}`}, 0))`;
+      const recentRequest = await tx.emailToken.findFirst({
+        where: {
+          userId: user.id,
+          purpose: 'VERIFY_EMAIL',
+          usedAt: null,
+          createdAt: { gt: new Date(Date.now() - verificationResendPolicy.accountCooldownMs) }
+        },
+        select: { id: true }
+      });
+      if (recentRequest) return null;
+
+      return tx.emailToken.create({
+        data: {
+          userId: user.id,
+          purpose: 'VERIFY_EMAIL',
+          tokenHash: emailTokenHash(token),
+          expiresAt: new Date(Date.now() + verificationResendPolicy.tokenTtlMs)
+        },
+        select: { id: true }
+      });
+    });
+
+    if (record) {
+      try {
+        await sendVerificationEmail(user.email, token);
+        await prisma.emailToken.updateMany({
+          where: { userId: user.id, purpose: 'VERIFY_EMAIL', id: { not: record.id }, usedAt: null },
+          data: { usedAt: new Date() }
+        });
+      } catch (error) {
+        logEmailFailure('verification', error);
+        await prisma.emailToken.updateMany({ where: { id: record.id, usedAt: null }, data: { usedAt: new Date() } });
+      }
+    }
+  }
+
+  await waitForMinimumResponseTime(startedAt);
+  res.status(202).json(verificationResendResponse());
 });
 
 authRouter.post('/forgot-password', resetRequestLimiter, async (req, res) => {
