@@ -1,8 +1,17 @@
-import { Router } from 'express';
+import express, { Router } from 'express';
 import { prisma } from './db.js';
-import { cleanText, hasUrl, requireAuth, requireRole } from './security.js';
-import { isParticipant } from './privacy.js';
+import { cleanText, hasUrl, ipHash, requireAuth, requireRole } from './security.js';
 import { messageSchema } from './validation.js';
+import { config } from './config.js';
+import { closePrivateConversationsForBlock, findAvailablePrivateConversation } from './private-conversation.js';
+import {
+  applyPrivateMediaHeaders,
+  createPrivateImageMessage,
+  deletePrivateMessageForEveryone,
+  PrivateMediaError,
+  readAuthorizedPrivateMedia
+} from './private-media.js';
+import { emitPrivateEvent } from './private-events.js';
 
 export const apiRouter = Router();
 apiRouter.get('/cities', async (_req, res) => {
@@ -29,10 +38,7 @@ apiRouter.get('/blocks', requireAuth, async (req, res) => {
 apiRouter.post('/blocks/:userId', requireAuth, async (req, res) => {
   const blockerId = req.auth!.userId; const blockedUserId = String(req.params.userId);
   if (blockedUserId === blockerId || !await prisma.user.findUnique({ where: { id: blockedUserId }, select: { id: true } })) return res.status(400).json({ error: 'Ação inválida.' });
-  await prisma.$transaction(async tx => {
-    await tx.userBlock.upsert({ where: { blockerId_blockedUserId: { blockerId, blockedUserId } }, update: {}, create: { blockerId, blockedUserId } });
-    await tx.privateConversation.updateMany({ where: { status: { in: ['PENDING', 'ACCEPTED'] }, OR: [{ participantOneId: blockerId, participantTwoId: blockedUserId }, { participantOneId: blockedUserId, participantTwoId: blockerId }] }, data: { status: 'CLOSED', closedAt: new Date() } });
-  });
+  await prisma.$transaction(tx => closePrivateConversationsForBlock(tx, blockerId, blockedUserId));
   res.status(201).json({ message: 'Usuário bloqueado.' });
 });
 apiRouter.delete('/blocks/:userId', requireAuth, async (req, res) => {
@@ -56,20 +62,79 @@ apiRouter.get('/private-conversations', requireAuth, async (req, res) => {
   const conversations = await prisma.privateConversation.findMany({ where: { OR: [{ participantOneId: userId }, { participantTwoId: userId }], status: { in: ['PENDING', 'ACCEPTED'] } }, include: { participantOne: { select: { id: true, profile: true } }, participantTwo: { select: { id: true, profile: true } }, messages: { where: { senderId: { not: userId }, readAt: null, deletedAt: null }, select: { id: true } } }, orderBy: { createdAt: 'desc' } });
   res.json(conversations.map(({ messages, ...conversation }) => ({ ...conversation, unreadCount: messages.length })));
 });
+apiRouter.get('/private-conversations/:id', requireAuth, async (req, res) => {
+  const userId = req.auth!.userId;
+  const conversation = await prisma.privateConversation.findFirst({
+    where: { id: String(req.params.id), OR: [{ participantOneId: userId }, { participantTwoId: userId }], status: { in: ['PENDING', 'ACCEPTED'] } },
+    include: { participantOne: { select: { id: true, profile: true } }, participantTwo: { select: { id: true, profile: true } } }
+  });
+  if (!conversation) return res.status(404).json({ error: 'Conversa não encontrada.' });
+  res.json(conversation);
+});
 apiRouter.get('/private-conversations/:id/messages', requireAuth, async (req, res) => {
   const userId = req.auth!.userId;
-  const conversation = await prisma.privateConversation.findUnique({ where: { id: String(req.params.id) } });
-  if (!conversation || conversation.status !== 'ACCEPTED' || !isParticipant(conversation, userId)) return res.status(404).json({ error: 'Conversa não encontrada.' });
   const messages = await prisma.$transaction(async tx => {
-    const result = await tx.privateMessage.findMany({ where: { conversationId: conversation.id, deletedAt: null, moderationStatus: 'VISIBLE' }, include: { sender: { select: { id: true, profile: true } } }, orderBy: { createdAt: 'asc' }, take: 100 });
+    const conversation = await findAvailablePrivateConversation(tx, String(req.params.id), userId);
+    if (!conversation) return null;
+    const result = await tx.privateMessage.findMany({
+      where: { conversationId: conversation.id, deletedAt: null, moderationStatus: 'VISIBLE' },
+      include: {
+        sender: { select: { id: true, profile: true } },
+        media: { select: { id: true, mimeType: true, byteSize: true, width: true, height: true, createdAt: true, expiresAt: true } }
+      },
+      orderBy: { createdAt: 'asc' },
+      take: 100
+    });
     await tx.privateMessage.updateMany({ where: { conversationId: conversation.id, senderId: { not: userId }, readAt: null }, data: { readAt: new Date() } });
     return result;
   });
+  if (!messages) return res.status(404).json({ error: 'Conversa não encontrada.' });
   res.json(messages);
+});
+apiRouter.post('/private-conversations/:id/images', requireAuth, express.raw({ type: ['image/jpeg', 'image/png', 'image/webp', 'application/octet-stream'], limit: config.PRIVATE_MEDIA_MAX_BYTES }), async (req, res) => {
+  if (!Buffer.isBuffer(req.body)) return res.status(400).json({ error: 'Imagem inválida.' });
+  try {
+    const created = await createPrivateImageMessage({
+      conversationId: String(req.params.id),
+      authorId: req.auth!.userId,
+      ipKey: ipHash(req.ip ?? ''),
+      bytes: req.body
+    });
+    const message = { ...created.message, media: created.media };
+    emitPrivateEvent(
+      [created.conversation.participantOneId, created.conversation.participantTwoId],
+      'private:media:new',
+      { message, media: created.media }
+    );
+    res.status(201).json({ message, media: created.media });
+  } catch (error) {
+    if (error instanceof PrivateMediaError && error.code === 'UNAVAILABLE') return res.status(404).json({ error: 'Conversa não encontrada.' });
+    if (error instanceof PrivateMediaError && error.code === 'RATE_LIMITED') return res.status(429).json({ error: 'Limite de imagens atingido. Aguarde um pouco.' });
+    if (error instanceof PrivateMediaError && ['INVALID_IMAGE', 'LIMIT_EXCEEDED'].includes(error.code)) return res.status(400).json({ error: 'Imagem inválida ou fora dos limites permitidos.' });
+    return res.status(500).json({ error: 'Não foi possível enviar a imagem.' });
+  }
+});
+apiRouter.get('/private-images/:id', requireAuth, async (req, res) => {
+  const media = await readAuthorizedPrivateMedia(String(req.params.id), req.auth!.userId);
+  // Deliberately use the same response for missing, expired, deleted, blocked and unauthorized media.
+  if (!media) return res.status(404).json({ error: 'Mídia não encontrada.' });
+  applyPrivateMediaHeaders(res, media.mimeType);
+  res.status(200).send(media.bytes);
+});
+apiRouter.delete('/private-messages/:id', requireAuth, async (req, res) => {
+  try {
+    const deleted = await deletePrivateMessageForEveryone(String(req.params.id), req.auth!.userId);
+    if (!deleted) return res.status(404).json({ error: 'Mensagem não encontrada.' });
+    emitPrivateEvent([deleted.participantOneId, deleted.participantTwoId], 'private:message:deleted', { conversationId: deleted.conversationId, messageId: String(req.params.id) });
+    res.status(204).end();
+  } catch (error) {
+    if (error instanceof PrivateMediaError && error.code === 'DELETE_NOT_ALLOWED') return res.status(403).json({ error: 'O prazo para apagar esta mensagem expirou.' });
+    return res.status(500).json({ error: 'Não foi possível apagar a mensagem.' });
+  }
 });
 apiRouter.post('/private-conversations/:id/close', requireAuth, async (req, res) => {
   const conversation = await prisma.privateConversation.findUnique({ where: { id: String(req.params.id) } });
-  if (!conversation || !isParticipant(conversation, req.auth!.userId)) return res.status(404).json({ error: 'Conversa não encontrada.' });
+  if (!conversation || (conversation.participantOneId !== req.auth!.userId && conversation.participantTwoId !== req.auth!.userId)) return res.status(404).json({ error: 'Conversa não encontrada.' });
   await prisma.privateConversation.update({ where: { id: conversation.id }, data: { status: 'CLOSED', closedAt: new Date() } });
   res.status(204).end();
 });

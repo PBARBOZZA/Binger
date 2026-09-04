@@ -11,7 +11,9 @@
     "lint": "tsc -p tsconfig.json --noEmit",
     "db:migrate": "prisma migrate dev",
     "db:deploy": "prisma migrate deploy",
-    "db:seed": "prisma db seed"
+    "db:seed": "prisma db seed",
+    "media:cleanup": "node dist/private-media-cleanup.js",
+    "media:cleanup:dev": "tsx src/private-media-cleanup.ts"
   },
   "dependencies": {
     "@prisma/client": "^6.11.1",
@@ -24,6 +26,7 @@
     "express-rate-limit": "^7.5.1",
     "helmet": "^8.1.0",
     "nodemailer": "^9.0.3",
+    "sharp": "^0.34.3",
     "socket.io": "^4.8.1",
     "zod": "^3.25.67"
   },

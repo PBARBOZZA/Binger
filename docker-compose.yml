@@ -8,8 +8,11 @@ services:
   api:
     build: { context: ., dockerfile: apps/api/Dockerfile }
     env_file: .env
-    environment: { DATABASE_URL: "postgresql://binger:binger_dev@db:5432/binger?schema=public" }
+    environment:
+      DATABASE_URL: "postgresql://binger:binger_dev@db:5432/binger?schema=public"
+      PRIVATE_MEDIA_ROOT: "/var/lib/binger-private-media"
     ports: ["3001:3001"]
+    volumes: ["private_media_data:/var/lib/binger-private-media"]
     depends_on: { db: { condition: service_healthy } }
     healthcheck: { test: ["CMD", "wget", "-qO-", "http://localhost:3001/health"], interval: 15s, timeout: 5s, retries: 5 }
     restart: unless-stopped
@@ -18,4 +21,4 @@ services:
     ports: ["8080:80"]
     depends_on: { api: { condition: service_healthy } }
     restart: unless-stopped
-volumes: { postgres_data: {} }
+volumes: { postgres_data: {}, private_media_data: {} }

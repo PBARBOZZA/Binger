@@ -1,15 +1,16 @@
 import type { Server } from 'socket.io';
-import { randomUUID } from 'node:crypto';
 import { Prisma } from '@prisma/client';
 import cookie from 'cookie';
 import { prisma } from './db.js';
 import { hash, SESSION_COOKIE } from './security.js';
-import { allowedImageType, canonicalPair, isBlockedEitherWay, isParticipant, otherParticipantId } from './privacy.js';
+import { canonicalPair, isBlockedEitherWay, otherParticipantId } from './privacy.js';
 import { validateMessage } from './api-routes.js';
+import { closePrivateConversationsForBlock, createPrivateTextMessage, getAvailablePrivateConversation, lockPrivatePair } from './private-conversation.js';
+import { setPrivateEventEmitter } from './private-events.js';
+import { PUBLIC_IMAGE_REJECTION_MESSAGE } from './private-media.js';
 
 type Presence = { userId: string; nickname: string; ageRange: string };
 const messageTimes = new Map<string, number[]>();
-const imageTimes = new Map<string, number[]>();
 const presence = new Map<string, Map<string, Presence>>();
 
 function withinRateLimit(store: Map<string, number[]>, key: string, limit: number) {
@@ -22,14 +23,8 @@ function emitToUsers(io: Server, userIds: string[], event: string, data: unknown
   for (const id of new Set(userIds)) io.to(`user:${id}`).emit(event, data);
 }
 
-function binaryPayload(input: unknown): Buffer | null {
-  if (Buffer.isBuffer(input)) return input;
-  if (input instanceof ArrayBuffer) return Buffer.from(input);
-  if (ArrayBuffer.isView(input)) return Buffer.from(input.buffer, input.byteOffset, input.byteLength);
-  return null;
-}
-
 export function configureSocket(io: Server) {
+  setPrivateEventEmitter((userIds, event, payload) => emitToUsers(io, userIds, event, payload));
   io.use(async (socket, next) => {
     try {
       const token = cookie.parse(socket.handshake.headers.cookie ?? '')[SESSION_COOKIE];
@@ -90,8 +85,14 @@ export function configureSocket(io: Server) {
         if (!invited?.profile || invited.id === user.id || invited.profile.cityId !== user.profile.cityId || invited.profile.invitationPreference === 'NONE' || await isBlockedEitherWay(user.id, invited.id)) return ack?.({ error: 'Convite indisponível.' });
         if (invited.profile.invitationPreference === 'VERIFIED_ONLY' && !user.emailVerifiedAt) return ack?.({ error: 'Apenas contas confirmadas.' });
         const [participantOneId, participantTwoId] = canonicalPair(user.id, invited.id);
-        let conversation = await prisma.privateConversation.findFirst({ where: { participantOneId, participantTwoId, status: { in: ['PENDING', 'ACCEPTED'] } } });
-        if (!conversation) conversation = await prisma.privateConversation.create({ data: { participantOneId, participantTwoId, requestedById: user.id } });
+        const conversation = await prisma.$transaction(async tx => {
+          await lockPrivatePair(tx, user.id, invited.id);
+          const blocked = await tx.userBlock.findFirst({ where: { OR: [{ blockerId: user.id, blockedUserId: invited.id }, { blockerId: invited.id, blockedUserId: user.id }] }, select: { id: true } });
+          if (blocked) return null;
+          const existing = await tx.privateConversation.findFirst({ where: { participantOneId, participantTwoId, status: { in: ['PENDING', 'ACCEPTED'] } } });
+          return existing ?? tx.privateConversation.create({ data: { participantOneId, participantTwoId, requestedById: user.id } });
+        });
+        if (!conversation) return ack?.({ error: 'Convite indisponível.' });
         if (conversation.status === 'PENDING') emitToUsers(io, [invited.id], 'private:invite', { conversation, from: { id: user.id, profile: user.profile } });
         ack?.({ ok: true, conversationId: conversation.id, status: conversation.status });
       } catch (error) {
@@ -102,22 +103,30 @@ export function configureSocket(io: Server) {
     socket.on('private:invite:respond', async (input, ack) => {
       try {
         const conversationId = typeof input?.conversationId === 'string' ? input.conversationId : '';
-        const conversation = await prisma.privateConversation.findFirst({ where: { id: conversationId, status: 'PENDING', requestedById: { not: user.id }, OR: [{ participantOneId: user.id }, { participantTwoId: user.id }] } });
-        if (!conversation) return ack?.({ error: 'Convite inválido.' });
-        const requesterId = conversation.requestedById;
-        if (input?.block === true) {
-          await prisma.$transaction([prisma.userBlock.upsert({ where: { blockerId_blockedUserId: { blockerId: user.id, blockedUserId: requesterId } }, update: {}, create: { blockerId: user.id, blockedUserId: requesterId } }), prisma.privateConversation.update({ where: { id: conversation.id }, data: { status: 'CLOSED', closedAt: new Date() } })]);
-          return ack?.({ ok: true });
-        }
-        const accept = input?.accept === true && !await isBlockedEitherWay(user.id, requesterId);
-        const updated = await prisma.privateConversation.update({ where: { id: conversation.id }, data: accept ? { status: 'ACCEPTED', acceptedAt: new Date() } : { status: 'REJECTED', closedAt: new Date() } });
-        emitToUsers(io, [conversation.participantOneId, conversation.participantTwoId], accept ? 'private:invite:accepted' : 'private:invite:rejected', updated); ack?.({ ok: true });
+        const response = await prisma.$transaction(async tx => {
+          const preliminary = await tx.privateConversation.findFirst({ where: { id: conversationId, status: 'PENDING', requestedById: { not: user.id }, OR: [{ participantOneId: user.id }, { participantTwoId: user.id }] } });
+          if (!preliminary) return null;
+          await lockPrivatePair(tx, preliminary.participantOneId, preliminary.participantTwoId);
+          const conversation = await tx.privateConversation.findFirst({ where: { id: conversationId, status: 'PENDING', requestedById: { not: user.id }, OR: [{ participantOneId: user.id }, { participantTwoId: user.id }] } });
+          if (!conversation) return null;
+          if (input?.block === true) {
+            await closePrivateConversationsForBlock(tx, user.id, conversation.requestedById);
+            return { updated: conversation, accepted: false, blocked: true };
+          }
+          const blocked = await tx.userBlock.findFirst({ where: { OR: [{ blockerId: user.id, blockedUserId: conversation.requestedById }, { blockerId: conversation.requestedById, blockedUserId: user.id }] }, select: { id: true } });
+          const accepted = input?.accept === true && !blocked;
+          const updated = await tx.privateConversation.update({ where: { id: conversation.id }, data: accepted ? { status: 'ACCEPTED', acceptedAt: new Date() } : { status: 'REJECTED', closedAt: new Date() } });
+          return { updated, accepted, blocked: false };
+        });
+        if (!response) return ack?.({ error: 'Convite inválido.' });
+        emitToUsers(io, [response.updated.participantOneId, response.updated.participantTwoId], response.accepted ? 'private:invite:accepted' : 'private:invite:rejected', response.updated);
+        ack?.({ ok: true });
       } catch { ack?.({ error: 'Não foi possível responder ao convite.' }); }
     });
 
     socket.on('private:join', async (conversationId: string, ack) => {
-      const conversation = await prisma.privateConversation.findUnique({ where: { id: conversationId } });
-      if (!conversation || conversation.status !== 'ACCEPTED' || !isParticipant(conversation, user.id) || await isBlockedEitherWay(conversation.participantOneId, conversation.participantTwoId)) return ack?.({ error: 'Conversa indisponível.' });
+      const conversation = await getAvailablePrivateConversation(conversationId, user.id);
+      if (!conversation) return ack?.({ error: 'Conversa indisponível.' });
       await socket.join(`private:${conversation.id}`); ack?.({ ok: true });
     });
 
@@ -125,43 +134,23 @@ export function configureSocket(io: Server) {
       try {
         const parsed = validateMessage(payload); if ('error' in parsed) return ack?.({ error: parsed.error });
         const conversationId = typeof payload?.conversationId === 'string' ? payload.conversationId : '';
-        const conversation = await prisma.privateConversation.findUnique({ where: { id: conversationId } });
-        if (!conversation || conversation.status !== 'ACCEPTED' || !isParticipant(conversation, user.id) || !socket.rooms.has(`private:${conversation.id}`) || await isBlockedEitherWay(conversation.participantOneId, conversation.participantTwoId)) return ack?.({ error: 'Conversa indisponível.' });
+        if (!socket.rooms.has(`private:${conversationId}`)) return ack?.({ error: 'Conversa indisponível.' });
         if (!withinRateLimit(messageTimes, user.id, 12)) return ack?.({ error: 'Limite de mensagens atingido.' });
-        const message = await prisma.privateMessage.create({ data: { conversationId, senderId: user.id, content: parsed.content } });
-        emitToUsers(io, [conversation.participantOneId, conversation.participantTwoId], 'private:message:new', { ...message, sender: { id: user.id, profile: user.profile } }); ack?.({ ok: true });
+        const created = await createPrivateTextMessage(conversationId, user.id, parsed.content);
+        if (!created) return ack?.({ error: 'Conversa indisponível.' });
+        emitToUsers(io, [created.conversation.participantOneId, created.conversation.participantTwoId], 'private:message:new', { ...created.message, sender: { id: user.id, profile: user.profile } }); ack?.({ ok: true });
       } catch { ack?.({ error: 'Não foi possível enviar a mensagem.' }); }
     });
 
     socket.on('private:typing', async (payload) => {
-      const conversation = await prisma.privateConversation.findUnique({ where: { id: typeof payload?.conversationId === 'string' ? payload.conversationId : '' } });
-      if (!conversation || conversation.status !== 'ACCEPTED' || !isParticipant(conversation, user.id) || await isBlockedEitherWay(conversation.participantOneId, conversation.participantTwoId)) return;
+      const conversation = await getAvailablePrivateConversation(typeof payload?.conversationId === 'string' ? payload.conversationId : '', user.id);
+      if (!conversation) return;
       io.to(`user:${otherParticipantId(conversation, user.id)}`).emit('private:typing', { conversationId: conversation.id, typing: payload?.typing === true });
     });
 
-    socket.on('image:send', async (payload, ack) => {
-      try {
-        const bytes = binaryPayload(payload?.data);
-        if (!bytes || bytes.byteLength === 0 || bytes.byteLength > 250 * 1024 || !allowedImageType(bytes)) return ack?.({ error: 'Imagem inválida ou maior que 250 KB.' });
-        if (!withinRateLimit(imageTimes, user.id, 6)) return ack?.({ error: 'Limite de imagens atingido. Aguarde um pouco.' });
-        const image = { id: randomUUID(), data: bytes, mimeType: allowedImageType(bytes), sender: { id: user.id, profile: user.profile }, createdAt: new Date().toISOString() };
-        if (payload?.kind === 'private') {
-          const conversation = await prisma.privateConversation.findUnique({ where: { id: typeof payload.conversationId === 'string' ? payload.conversationId : '' } });
-          if (!conversation || conversation.status !== 'ACCEPTED' || !isParticipant(conversation, user.id) || !socket.rooms.has(`private:${conversation.id}`) || await isBlockedEitherWay(conversation.participantOneId, conversation.participantTwoId)) return ack?.({ error: 'Conversa indisponível.' });
-          emitToUsers(io, [conversation.participantOneId, conversation.participantTwoId], 'image:new', { ...image, kind: 'private', conversationId: conversation.id });
-        } else {
-          const roomId = typeof payload?.roomId === 'string' ? payload.roomId : '';
-          if (!socket.rooms.has(`room:${roomId}`)) return ack?.({ error: 'Sala indisponível.' });
-          if (payload?.kind === 'reserved') {
-            const recipientId = typeof payload?.recipientId === 'string' ? payload.recipientId : '';
-            if (!recipientId || recipientId === user.id || await isBlockedEitherWay(user.id, recipientId) || ![...(presence.get(roomId)?.values() ?? [])].some(person => person.userId === recipientId)) return ack?.({ error: 'Interação reservada indisponível.' });
-            emitToUsers(io, [user.id, recipientId], 'image:new', { ...image, kind: 'reserved', roomId, recipientId });
-          } else {
-            io.to(`room:${roomId}`).emit('image:new', { ...image, kind: 'public', roomId });
-          }
-        }
-        ack?.({ ok: true });
-      } catch { ack?.({ error: 'Não foi possível enviar a imagem.' }); }
+    socket.on('image:send', (_payload, ack) => {
+      // Image bytes are never accepted over Socket.IO. Private uploads use the authenticated HTTP endpoint.
+      ack?.({ error: PUBLIC_IMAGE_REJECTION_MESSAGE });
     });
 
     socket.on('disconnecting', () => {

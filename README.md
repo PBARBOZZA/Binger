@@ -35,6 +35,14 @@ Use DNS e Caddy/Nginx na frente dos containers, TLS automático, `WEB_ORIGIN` e 
 
 Implementado: Argon2id, sessão opaca armazenada como hash, cookie HttpOnly/SameSite/Secure em produção, revogação, recuperação de senha por token opaco de uso único, CORS restrito, Helmet, limites de corpo e requisições, texto puro, bloqueio de URLs, autorização REST/WebSocket, minimização de IP por HMAC, auditoria administrativa e prioridade crítica para suspeita de menor.
 
+### Mídia em conversas privadas
+
+Imagens não são aceitas na sala pública nem em mensagens reservadas. Apenas participantes de uma conversa privada aceita podem enviar JPEG, PNG ou WebP; a API valida o conteúdo real, impõe limites e reprocessa o arquivo antes de guardá-lo como mídia privada. O arquivo fica em `PRIVATE_MEDIA_ROOT`, fora do checkout, de `/var/www/binger`, do diretório público e de qualquer raiz servida diretamente por Caddy ou Nginx. No Docker Compose, o volume `private_media_data` é montado somente no contêiner da API.
+
+O acesso ocorre por endpoint autenticado e autorizado, sem URL pública permanente, com `Cache-Control: private, no-store`. Não há botão de download. Bloquear arrastar ou o menu de contexto é apenas uma camada de UX: nenhuma aplicação web consegue impedir que uma pessoa autorizada faça captura de tela, fotografe a tela ou copie o conteúdo.
+
+Em produção, configure `PRIVATE_MEDIA_ROOT` como um caminho absoluto dedicado, com permissões apenas para o processo da API. Não crie uma regra Caddy/Nginx que sirva esse caminho, nem o inclua em backups públicos ou no Git. As imagens expiram conforme `PRIVATE_MEDIA_RETENTION_HOURS`; o autor pode usar “Apagar para todos” durante `PRIVATE_MESSAGE_DELETE_WINDOW_MINUTES`, e a rotina de limpeza remove arquivos excluídos, expirados e órfãos. Agende `npm run media:cleanup --workspace @binger/api` a cada 15 minutos (ou o equivalente `node dist/private-media-cleanup.js` no contêiner já compilado).
+
 Riscos ainda abertos antes de operação pública: provedor SMTP transacional e monitoramento de entrega; CSRF token dedicado para navegadores legados; rate limit distribuído e antifraude; verificação etária externa; moderação operacional 24/7; política jurídica de retenção/LGPD revisada; exportação/exclusão automatizadas; backup restaurado em ensaio; WAF; observabilidade; testes de invasão; mensagens privadas completas e UI de moderação. O MVP não oferece criptografia ponta a ponta.
 
 ## Próxima versão
