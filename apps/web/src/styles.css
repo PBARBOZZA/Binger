@@ -67,6 +67,19 @@
   }
 }
 
+/* Regional room selection */
+.chat{grid-template-rows:minmax(0,1fr)}
+.rooms,.participants{min-height:0;overflow-y:auto}
+.rooms>*{flex-shrink:0}.rooms .conversation-list{flex:1 0 auto;overflow:visible}
+.room-picker{display:grid;gap:8px;margin:0 0 16px;font-size:12px;font-weight:700;color:#eee3ee}
+.room-picker select{width:100%;min-width:0;min-height:46px;padding:10px 8px;color:#fff;background:#2b2033;border:1px solid #69506c;border-radius:10px;cursor:pointer}
+.room-picker small{font-size:11px;font-weight:400;color:var(--muted);line-height:1.5}
+.public-kicker{font-size:10px;font-weight:700;color:#70dace;letter-spacing:.08em}
+.public-destination{padding:9px 20px;background:#172724;border-top:1px solid #2e4741;color:#c4dfd9;font-size:12px;line-height:1.4;flex-shrink:0}
+.participants-room{display:block;color:#bdb4c4;font-size:11px;margin:5px 0;line-height:1.4}
+.rooms .room small{white-space:normal;line-height:1.4}
+@media(max-width:850px){.public-destination{padding:9px 12px}.messages>header .conversation-heading h1{white-space:normal;font-size:17px;line-height:1.25}.room-picker select{font-size:16px}}
+
 /* Private conversation and protected-media states */
 :focus-visible{outline:3px solid #f08ab1;outline-offset:3px}
 .chat{height:100dvh;min-height:0}

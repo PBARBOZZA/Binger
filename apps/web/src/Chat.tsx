@@ -6,6 +6,7 @@ import { Ban, BellOff, ChevronLeft, Flag, ImageOff, ImagePlus, Lock, LogOut, Men
 
 type Profile = { nickname: string; ageRange: string; city: { name: string }; cityId?: string };
 type User = { id: string; profile: Profile };
+type ChatRoom = { id: string; slug: string; name: string; city: string; state: string; isActive: boolean };
 type Participant = { userId: string; nickname: string; ageRange: string };
 type PrivateMedia = { id: string; mimeType: string; byteSize: number; width: number; height: number; expiresAt: string };
 type ChatMessage = {
@@ -17,6 +18,7 @@ type ChatMessage = {
   recipient?: User | null;
   scope?: 'PUBLIC' | 'RESERVED';
   blockedForMe?: boolean;
+  roomId?: string;
   conversationId?: string;
   kind?: 'TEXT' | 'IMAGE';
   media?: PrivateMedia | null;
@@ -34,7 +36,7 @@ type Conversation = {
 type InviteEvent = { conversation: Conversation; from: User };
 type PrivateMediaEvent = { message: ChatMessage; media: PrivateMedia };
 type ImageUploadResponse = { message: ChatMessage; media: PrivateMedia };
-type SocketAck = { ok?: boolean; error?: string };
+type SocketAck = { ok?: boolean; error?: string; roomId?: string };
 type PendingImage = { file: File; url: string };
 
 const color = (id: string) => `hsl(${[...id].reduce((n, c) => n + c.charCodeAt(0), 0) % 360} 48% 42%)`;
@@ -57,6 +59,12 @@ export function Chat() {
   const { roomId, conversationId } = useParams();
   const navigate = useNavigate();
   const [me, setMe] = useState<User | null>(null);
+  const [rooms, setRooms] = useState<ChatRoom[]>([]);
+  const [joinedRoomId, setJoinedRoomId] = useState<string | null>(null);
+  const [historyRoomId, setHistoryRoomId] = useState<string | null>(null);
+  const [roomLoading, setRoomLoading] = useState(true);
+  const currentRoom = rooms.find(room => room.id === roomId || room.slug === roomId);
+  const roomLabel = currentRoom ? `${currentRoom.city} - ${currentRoom.state}` : 'Sala indisponível';
   const [roomMessages, setRoomMessages] = useState<ChatMessage[]>([]);
   const [privateMessages, setPrivateMessages] = useState<ChatMessage[]>([]);
   const [people, setPeople] = useState<Participant[]>([]);
@@ -135,13 +143,13 @@ export function Chat() {
         const currentUser = await api<User>('/auth/me');
         if (!active) return;
         setMe(currentUser);
-        const [messages, listedConversations] = await Promise.allSettled([
-          api<ChatMessage[]>(`/rooms/${roomId}/messages`),
+        const [listedRooms, listedConversations] = await Promise.allSettled([
+          api<ChatRoom[]>('/rooms'),
           api<Conversation[]>('/private-conversations')
         ]);
         if (!active) return;
-        if (messages.status === 'fulfilled') setRoomMessages(messages.value);
-        else setRoomError(errorText(messages.reason, 'Não foi possível carregar a conversa geral.'));
+        if (listedRooms.status === 'fulfilled') setRooms(listedRooms.value);
+        else setRoomError(errorText(listedRooms.reason, 'Não foi possível carregar as salas.'));
         if (listedConversations.status === 'fulfilled') setConversations(listedConversations.value);
         else setError(errorText(listedConversations.reason, 'Não foi possível carregar as conversas privadas.'));
       } catch {
@@ -152,27 +160,76 @@ export function Chat() {
     }
     void load();
     return () => { active = false; };
-  }, [navigate, roomId]);
+  }, [navigate]);
 
   useEffect(() => {
-    if (!roomId) return;
+    setRoomMessages([]);
+    setPeople([]);
+    setReservedFor(null);
+    setMenuUser(null);
+    setShownBlocked(new Set());
+    setError('');
+    setNotice('');
+    setJoinedRoomId(null);
+    setHistoryRoomId(null);
+    setRoomLoading(true);
+    if (initialLoading) return;
+    if (currentRoom) setRoomError('');
+    else setRoomLoading(false);
+    const selectedRoomId = currentRoom?.id;
+    let active = true;
+    let bufferedMessages: ChatMessage[] = [];
+    let connectionVersion = 0;
+    let fetchingHistory = false;
+    setTransportStatus('connecting');
     const socket = io(API_URL, { withCredentials: true });
     socketRef.current = socket;
     socket.on('connect', () => {
       setTransportStatus('online');
-      socket.emit('room:join', roomId, (reply: SocketAck | undefined) => {
-        if (reply?.error) setRoomError(reply.error);
+      const version = ++connectionVersion;
+      bufferedMessages = [];
+      fetchingHistory = true;
+      setRoomLoading(Boolean(selectedRoomId));
+      setHistoryRoomId(null);
+      if (selectedRoomId) socket.emit('room:join', selectedRoomId, async (reply: SocketAck | undefined) => {
+        if (!active || version !== connectionVersion) return;
+        if (!reply?.ok || reply.roomId !== selectedRoomId) {
+          setRoomError(reply?.error ?? 'Não foi possível entrar na sala.');
+          setRoomLoading(false);
+          return;
+        }
+        setJoinedRoomId(selectedRoomId);
+        try {
+          const history = await api<ChatMessage[]>(`/rooms/${encodeURIComponent(selectedRoomId)}/messages`);
+          if (!active || version !== connectionVersion) return;
+          setRoomMessages(bufferedMessages.reduce(upsertMessage, history.filter(message => message.roomId === selectedRoomId)));
+          bufferedMessages = [];
+          setHistoryRoomId(selectedRoomId);
+          setRoomError('');
+        } catch (fetchError) {
+          if (active && version === connectionVersion) setRoomError(errorText(fetchError, 'Não foi possível carregar esta sala.'));
+        } finally {
+          if (active && version === connectionVersion) { fetchingHistory = false; setRoomLoading(false); }
+        }
       });
       const requestedConversation = routeConversationRef.current;
       if (requestedConversation) void joinPrivateSocket(requestedConversation);
     });
     socket.on('connect_error', () => setTransportStatus('offline'));
     socket.on('disconnect', () => {
+      ++connectionVersion;
       setTransportStatus('offline');
+      setJoinedRoomId(null);
       setPrivateJoined(false);
     });
-    socket.on('room:message:new', (message: ChatMessage) => setRoomMessages(current => upsertMessage(current, message)));
-    socket.on('room:participants', setPeople);
+    socket.on('room:message:new', (message: ChatMessage) => {
+      if (!active || message.roomId !== selectedRoomId) return;
+      if (fetchingHistory) bufferedMessages = upsertMessage(bufferedMessages, message);
+      setRoomMessages(current => upsertMessage(current, message));
+    });
+    socket.on('room:presence', (event: { roomId: string; participants: Participant[] }) => {
+      if (active && event.roomId === selectedRoomId) setPeople(event.participants);
+    });
     socket.on('private:invite', (_invite: InviteEvent) => { void refreshConversations(); });
     socket.on('private:invite:accepted', () => { void refreshConversations(); });
     socket.on('private:invite:rejected', () => { void refreshConversations(); });
@@ -189,10 +246,11 @@ export function Chat() {
       if (event.conversationId === routeConversationRef.current) setPrivateMessages(current => current.filter(message => message.id !== event.messageId));
     });
     return () => {
+      active = false;
       socket.disconnect();
       if (socketRef.current === socket) socketRef.current = null;
     };
-  }, [joinPrivateSocket, refreshConversations, roomId]);
+  }, [joinPrivateSocket, refreshConversations, currentRoom?.id, initialLoading]);
 
   useEffect(() => {
     if (!conversationId) {
@@ -262,8 +320,10 @@ export function Chat() {
   const incomingInvites = useMemo(() => me ? conversations.filter(conversation => conversation.status === 'PENDING' && conversation.requestedById !== me.id) : [], [conversations, me]);
   const outgoingInvites = useMemo(() => me ? conversations.filter(conversation => conversation.status === 'PENDING' && conversation.requestedById === me.id) : [], [conversations, me]);
   const acceptedConversations = useMemo(() => conversations.filter(conversation => conversation.status === 'ACCEPTED'), [conversations]);
-  const messages = activeConversation ? privateMessages : roomMessages;
-  const canSend = transportStatus === 'online' && (!activeConversation || privateJoined) && !conversationLoading && !privateError;
+  const roomReady = Boolean(currentRoom && joinedRoomId === currentRoom.id && historyRoomId === currentRoom.id && !roomLoading && !roomError);
+  const publicError = roomError || (!initialLoading && !currentRoom ? 'Esta sala não existe ou está desativada. Escolha outra cidade.' : '');
+  const messages = activeConversation ? privateMessages : historyRoomId === currentRoom?.id ? roomMessages : [];
+  const canSend = transportStatus === 'online' && (conversationId ? Boolean(activeConversation && privateJoined && !conversationLoading && !privateError) : roomReady);
   const privateImageAllowed = Boolean(activeConversation && !conversationLoading && !privateError);
   const privateImageEnabled = privateImageAllowed && canSend;
 
@@ -283,7 +343,7 @@ export function Chat() {
     const content = String(new FormData(form).get('message') ?? '').trim();
     if (!content) return;
     if (!canSend) {
-      setError(transportStatus !== 'online' ? 'Você está offline. Reconecte-se para enviar uma mensagem.' : 'A conversa privada ainda está sendo preparada.');
+      setError(transportStatus !== 'online' ? 'Você está offline. Reconecte-se para enviar uma mensagem.' : conversationId ? 'A conversa privada ainda está sendo preparada.' : 'Aguarde a entrada e o carregamento da sala selecionada.');
       return;
     }
     const socket = socketRef.current;
@@ -294,7 +354,7 @@ export function Chat() {
     const eventName = activeConversation ? 'private:message' : 'room:message';
     const payload = activeConversation
       ? { conversationId: activeConversation.id, content }
-      : { roomId, content, recipientId: reservedFor?.userId };
+      : { roomId: currentRoom?.id, content, recipientId: reservedFor?.userId };
     setSendingText(true);
     const reply = await socketAck(socket, eventName, payload);
     setSendingText(false);
@@ -450,10 +510,10 @@ export function Chat() {
     navigate('/');
   }
 
-  const displayTitle = activeConversation && recipient ? `Conversa privada com ${recipient.profile.nickname}` : 'Conversa Geral';
+  const displayTitle = activeConversation && recipient ? `Conversa privada com ${recipient.profile.nickname}` : conversationId ? 'Conversa privada' : roomLabel;
   const composerPlaceholder = activeConversation && recipient
     ? `Mensagem privada para ${recipient.profile.nickname}`
-    : reservedFor ? `Mensagem reservada para ${reservedFor.nickname}` : 'Escreva uma mensagem…';
+    : reservedFor ? `Mensagem reservada para ${reservedFor.nickname}` : `Mensagem pública em ${roomLabel}`;
 
   return <main className="chat">
     <aside id="chat-rooms" className={`rooms ${roomsDrawer ? 'open' : ''}`} aria-hidden={isCompact && !roomsDrawer}>
@@ -461,9 +521,23 @@ export function Chat() {
         <Link className="brand" to="/">binger<span>.</span></Link>
         <button className="mobile" type="button" aria-label="Fechar menu de conversas" onClick={() => setRoomsDrawer(false)}><X /></button>
       </div>
-      <div className="room-label">SUA CIDADE</div>
+      <div className="room-label">SALAS REGIONAIS</div>
+      <div className="room-picker"><label htmlFor="regional-room">Cidade e estado</label>
+        <select id="regional-room" aria-describedby="regional-room-help" value={currentRoom?.id ?? ''} disabled={initialLoading || rooms.length === 0} onChange={event => {
+          const selected = rooms.find(room => room.id === event.target.value);
+          if (!selected) return;
+          setReservedFor(null);
+          setMenuUser(null);
+          setRoomsDrawer(false);
+          navigate(`/sala/${selected.slug}`);
+        }}>
+          {!currentRoom && <option value="">Escolha uma sala</option>}
+          {rooms.map(room => <option key={room.id} value={room.id}>{room.city} - {room.state}{room.name !== 'Conversa Geral' ? ` · ${room.name}` : ''}</option>)}
+        </select>
+        <small id="regional-room-help">Escolha onde conversar. Sua cidade de perfil permanece a mesma.</small>
+      </div>
       <button type="button" className={`room ${!activeConversation && !conversationId ? 'active' : ''}`} onClick={() => { returnToGeneral(); setRoomsDrawer(false); }}>
-        <span>#</span><div><b>Conversa Geral</b><small>{me?.profile.city.name}</small></div>
+        <span>#</span><div><b>Chat público regional</b><small>{roomLabel}</small></div>
       </button>
 
       <div className="room-label private-label">CONVERSAS PRIVADAS</div>
@@ -507,9 +581,9 @@ export function Chat() {
       <header>
         <button className="mobile" type="button" aria-label="Abrir menu de conversas" aria-controls="chat-rooms" aria-expanded={roomsDrawer} onClick={() => setRoomsDrawer(true)}><Menu /></button>
         <div className="conversation-heading">
-          {activeConversation && <span className="private-kicker">CONVERSA PRIVADA</span>}
+          {conversationId ? <span className="private-kicker">CONVERSA PRIVADA</span> : <span className="public-kicker">CHAT PÚBLICO REGIONAL</span>}
           <h1>{displayTitle}</h1>
-          <p>{activeConversation ? <><i className={recipientOnline ? '' : 'offline'} /> {recipientOnline ? 'Online nesta sala' : 'Offline agora'}</> : <><i /> Ao vivo em {me?.profile.city.name}</>}</p>
+          <p>{conversationId ? activeConversation ? <><i className={recipientOnline ? '' : 'offline'} /> {recipientOnline ? 'Online nesta sala' : 'Fora desta sala agora'}</> : 'Acesso restrito aos participantes' : <><i className={roomReady ? '' : 'offline'} /> {roomReady ? 'Conversa Geral · somente texto' : publicError ? 'Escolha uma sala disponível' : 'Conectando à sala…'}</>}</p>
         </div>
         {activeConversation && <div className="header-actions">
           <button type="button" className="return-general" onClick={returnToGeneral}><ChevronLeft /> Voltar à conversa geral</button>
@@ -530,16 +604,16 @@ export function Chat() {
       {activeConversation && <div className="private-safety"><Lock /> Esta é uma conversa privada com {recipient?.profile.nickname}. Só participantes autorizados podem acessar as imagens.</div>}
 
       <div className="stream" role="log" aria-live="polite" aria-relevant="additions text">
-        {initialLoading && !activeConversation && !conversationId && <StateCard title="Carregando a conversa…" detail="Buscando as mensagens e as pessoas na sala." />}
-        {!initialLoading && !activeConversation && !conversationId && roomError && <StateCard title="Não foi possível carregar a conversa geral" detail={roomError} actionLabel="Tentar novamente" onAction={() => window.location.reload()} />}
+        {(initialLoading || (currentRoom && roomLoading)) && !publicError && !activeConversation && !conversationId && <StateCard title="Carregando a conversa…" detail="Buscando as mensagens e as pessoas na sala." />}
+        {!initialLoading && !activeConversation && !conversationId && publicError && <StateCard title="Não foi possível carregar a conversa geral" detail={publicError} actionLabel="Tentar novamente" onAction={() => window.location.reload()} />}
         {conversationId && conversationLoading && <StateCard title="Abrindo conversa privada…" detail="Confirmando o acesso e carregando as mensagens." />}
         {conversationId && !conversationLoading && privateError && <StateCard title="Conversa privada indisponível" detail={privateError} actionLabel="Voltar à conversa geral" onAction={returnToGeneral} />}
-        {!initialLoading && !roomError && !conversationId && messages.length === 0 && <StateCard title="A conversa está só começando." detail="Seja gentil e dê o primeiro oi." />}
+        {!initialLoading && !roomLoading && !publicError && !conversationId && messages.length === 0 && <StateCard title="A conversa está só começando." detail="Seja gentil e dê o primeiro oi." />}
         {activeConversation && !conversationLoading && !privateError && messages.length === 0 && <StateCard title="Ainda não há mensagens nesta conversa." detail={recipientOnline ? 'A pessoa está online agora.' : 'A pessoa está offline agora; você pode deixar uma mensagem.'} />}
         {(!conversationId || (activeConversation && !privateError)) && messages.map(message => <MessageView key={message.id} message={message} me={me} privateContext={Boolean(activeConversation)} shown={shownBlocked.has(message.id)} deleting={deletingMessageId === message.id} onShow={() => setShownBlocked(current => new Set(current).add(message.id))} onMenu={user => setMenuUser({ userId: user.id, nickname: user.profile.nickname, ageRange: user.profile.ageRange })} onDelete={() => void removeForEveryone(message)} onImageNotice={setNotice} />)}
       </div>
 
-      {transportStatus !== 'online' && <div className="connection-status" role="status">Você está offline. As mensagens e imagens voltarão a ficar disponíveis quando a conexão for restabelecida.</div>}
+      {transportStatus !== 'online' && <div className="connection-status" role="status">{transportStatus === 'connecting' ? 'Conectando ao chat…' : 'Você está offline. As mensagens e imagens voltarão a ficar disponíveis quando a conexão for restabelecida.'}</div>}
       {error && <div className="chat-error" role="alert">{error}</div>}
       {notice && <div className="chat-notice" role="status">{notice}</div>}
       {reservedFor && !activeConversation && !conversationId && <div className="reserved-banner"><Lock /> <span>Mensagem reservada para <b>{reservedFor.nickname}</b></span><button type="button" onClick={() => setReservedFor(null)}><X /> Cancelar</button></div>}
@@ -549,7 +623,8 @@ export function Chat() {
         <button type="button" aria-label="Remover imagem selecionada" onClick={() => setPendingImage(null)}><Trash2 /></button>
         <button type="button" className="send-image" disabled={uploadingImage || !privateImageEnabled} onClick={() => void sendPrivateImage()}>{uploadingImage ? 'Enviando…' : 'Enviar imagem'}</button>
       </div>}
-      <form className="composer" onSubmit={event => void sendText(event)}>
+      {!conversationId && <div className="public-destination">{reservedFor ? 'Reservada nesta sala' : 'Você vai publicar em'}: <strong>{roomLabel}</strong></div>}
+      <form key={conversationId ?? roomId} className="composer" onSubmit={event => void sendText(event)}>
         {privateImageAllowed ? <>
           <input ref={fileRef} className="sr-only" type="file" accept="image/jpeg,image/png,image/webp" onChange={choosePrivateImage} />
           <button type="button" className="image-button" disabled={!privateImageEnabled} aria-label="Adicionar imagem à conversa privada" onClick={() => fileRef.current?.click()}><ImagePlus /></button>
@@ -561,7 +636,7 @@ export function Chat() {
     </section>
 
     <aside id="chat-participants" className={`participants ${drawer ? 'open' : ''}`} aria-hidden={isCompact && !drawer}>
-      <header><div><b>Na sala agora</b><span>{people.length} participante{people.length === 1 ? '' : 's'}</span></div><button className="mobile" type="button" aria-label="Fechar participantes" onClick={() => setDrawer(false)}><X /></button></header>
+      <header><div><b>Na sala agora</b><small className="participants-room">{roomLabel}</small><span>{people.length} participante{people.length === 1 ? '' : 's'}</span></div><button className="mobile" type="button" aria-label="Fechar participantes" onClick={() => setDrawer(false)}><X /></button></header>
       <div className="people">{people.map(person => <button type="button" key={person.userId} className={person.userId === me?.id ? 'self' : ''} onClick={() => person.userId !== me?.id && setMenuUser(person)}><span className="avatar" style={{ background: color(person.userId) }}>{person.nickname.slice(0, 2).toUpperCase()}</span><span><b>{person.nickname}{person.userId === me?.id ? ' (você)' : ''}</b><small>{person.ageRange} · online</small></span></button>)}</div>
       <div className="invite-note">Selecione alguém para enviar uma mensagem reservada ou abrir uma conversa privada. Imagens não são permitidas na conversa geral.</div>
     </aside>

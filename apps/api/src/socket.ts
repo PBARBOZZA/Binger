@@ -8,6 +8,8 @@ import { validateMessage } from './api-routes.js';
 import { closePrivateConversationsForBlock, createPrivateTextMessage, getAvailablePrivateConversation, lockPrivatePair } from './private-conversation.js';
 import { setPrivateEventEmitter } from './private-events.js';
 import { PUBLIC_IMAGE_REJECTION_MESSAGE } from './private-media.js';
+import { findActiveRoom } from './rooms.js';
+import { roomMessageSchema } from './validation.js';
 
 type Presence = { userId: string; nickname: string; ageRange: string };
 const messageTimes = new Map<string, number[]>();
@@ -40,49 +42,100 @@ export function configureSocket(io: Server) {
     socket.join(`user:${user.id}`);
     socket.emit('connection:status', { connected: true });
 
-    socket.on('room:join', async (roomId: string, ack) => {
-      try {
-        const room = await prisma.room.findFirst({ where: { id: roomId, active: true, city: { active: true } } });
-        if (!room || user.profile.cityId !== room.cityId) return ack?.({ error: 'Sala indisponível.' });
-        for (const name of socket.rooms) if (name.startsWith('room:') && name !== `room:${room.id}`) await socket.leave(name);
-        await socket.join(`room:${room.id}`);
-        const roomPresence = presence.get(room.id) ?? new Map();
-        roomPresence.set(socket.id, { userId: user.id, nickname: user.profile.nickname, ageRange: user.profile.ageRange }); presence.set(room.id, roomPresence);
-        io.to(`room:${room.id}`).emit('room:participants', [...new Map([...roomPresence.values()].map(person => [person.userId, person])).values()]); ack?.({ ok: true });
-      } catch { ack?.({ error: 'Não foi possível entrar na sala.' }); }
+    function emitPresence(roomId: string) {
+      const participants = [...new Map([...(presence.get(roomId)?.values() ?? [])].map(person => [person.userId, person])).values()];
+      io.to(`room:${roomId}`).emit('room:presence', { roomId, participants });
+      // Preserve the old wire format while clients are updated during rollout.
+      io.to(`room:${roomId}`).emit('room:participants', participants);
+    }
+
+    function removePresence(roomId: string) {
+      const list = presence.get(roomId);
+      list?.delete(socket.id);
+      if (!list?.size) presence.delete(roomId);
+      emitPresence(roomId);
+    }
+
+    // Serialize joins and sends per connection: concurrent joins must never leave
+    // a socket subscribed to two public rooms or send using a stale membership.
+    let roomOperations = Promise.resolve();
+    function onRoomEvent(event: string, handler: (input: unknown, ack: (reply: unknown) => void) => Promise<void>) {
+      socket.on(event, (input, callback) => {
+        const ack = typeof callback === 'function' ? callback : () => {};
+        roomOperations = roomOperations.then(async () => {
+          if (!socket.connected) return;
+          const session = await prisma.session.findUnique({ where: { id: socket.data.sessionId }, include: { user: true } });
+          if (!session || session.revokedAt || session.expiresAt <= new Date() || session.user.status !== 'ACTIVE') {
+            ack({ error: 'Sessão inválida ou expirada.' });
+            socket.disconnect(true);
+            return;
+          }
+          await handler(input, ack);
+        }).catch(() => { ack({ error: 'Não foi possível concluir a operação na sala.' }); });
+      });
+    }
+
+    onRoomEvent('room:join', async (reference, ack) => {
+      for (const name of [...socket.rooms]) if (name.startsWith('room:')) {
+        await socket.leave(name);
+        removePresence(name.slice(5));
+      }
+      const room = await findActiveRoom(reference);
+      if (!room) return ack({ error: 'Sala indisponível.' });
+      if (!socket.connected) return;
+      await socket.join(`room:${room.id}`);
+      if (!socket.connected) { await socket.leave(`room:${room.id}`); return; }
+      const roomPresence = presence.get(room.id) ?? new Map();
+      roomPresence.set(socket.id, { userId: user.id, nickname: user.profile.nickname, ageRange: user.profile.ageRange });
+      presence.set(room.id, roomPresence);
+      emitPresence(room.id);
+      ack({ ok: true, roomId: room.id });
     });
 
-    socket.on('room:message', async (payload, ack) => {
-      try {
-        const parsed = validateMessage(payload);
-        if ('error' in parsed) return ack?.({ error: parsed.error });
-        const roomId = typeof payload?.roomId === 'string' ? payload.roomId : '';
-        const room = await prisma.room.findFirst({ where: { id: roomId, active: true, cityId: user.profile.cityId } });
-        if (!room || !socket.rooms.has(`room:${room.id}`)) return ack?.({ error: 'Entre na sala antes de enviar.' });
-        if (!withinRateLimit(messageTimes, user.id, 12)) return ack?.({ error: 'Limite de mensagens atingido. Aguarde um pouco.' });
-        const recipientId = typeof payload?.recipientId === 'string' ? payload.recipientId : null;
-        if (recipientId) {
-          if (recipientId === user.id || await isBlockedEitherWay(user.id, recipientId)) return ack?.({ error: 'Interação reservada indisponível.' });
-          const targetOnline = [...(presence.get(room.id)?.values() ?? [])].some(person => person.userId === recipientId);
-          if (!targetOnline) return ack?.({ error: 'A pessoa não está mais nesta sala.' });
-          const recipient = await prisma.user.findFirst({ where: { id: recipientId, profile: { cityId: room.cityId } }, select: { id: true, profile: true } });
-          if (!recipient) return ack?.({ error: 'Destinatário inválido.' });
-          const message = await prisma.roomMessage.create({ data: { roomId: room.id, userId: user.id, recipientId, scope: 'RESERVED', content: parsed.content } });
-          emitToUsers(io, [user.id, recipientId], 'room:message:new', { ...message, user: { id: user.id, profile: user.profile }, recipient, blockedForMe: false });
-        } else {
-          const message = await prisma.roomMessage.create({ data: { roomId: room.id, userId: user.id, scope: 'PUBLIC', content: parsed.content } });
-          const blockers = new Set((await prisma.userBlock.findMany({ where: { blockedUserId: user.id }, select: { blockerId: true } })).map(item => item.blockerId));
-          for (const target of io.sockets.adapter.rooms.get(`room:${room.id}`) ?? []) io.sockets.sockets.get(target)?.emit('room:message:new', { ...message, user: { id: user.id, profile: user.profile }, recipient: null, blockedForMe: blockers.has(io.sockets.sockets.get(target)?.data.user?.id) });
+    onRoomEvent('room:message', async (payload, ack) => {
+      const envelope = roomMessageSchema.safeParse(payload);
+      if (!envelope.success) return ack({ error: 'Mensagem inválida. Envie apenas texto e selecione uma sala.' });
+      const parsed = validateMessage(envelope.data);
+      if ('error' in parsed) return ack({ error: parsed.error });
+      const room = await findActiveRoom(envelope.data.roomId);
+      if (!room || !socket.rooms.has(`room:${room.id}`)) return ack({ error: 'Entre em uma sala ativa antes de enviar.' });
+      if (!withinRateLimit(messageTimes, user.id, 12)) return ack({ error: 'Limite de mensagens atingido. Aguarde um pouco.' });
+      const recipientId = envelope.data.recipientId ?? null;
+      if (recipientId) {
+        if (recipientId === user.id || await isBlockedEitherWay(user.id, recipientId)) return ack({ error: 'Interação reservada indisponível.' });
+        const targetOnline = [...(presence.get(room.id)?.values() ?? [])].some(person => person.userId === recipientId);
+        if (!targetOnline) return ack({ error: 'A pessoa não está mais nesta sala.' });
+        const recipient = await prisma.user.findFirst({ where: { id: recipientId, status: 'ACTIVE' }, select: { id: true, profile: true } });
+        if (!recipient?.profile) return ack({ error: 'Destinatário inválido.' });
+        const message = await prisma.roomMessage.create({ data: { roomId: room.id, userId: user.id, recipientId, scope: 'RESERVED', content: parsed.content } });
+        // Intersect room membership with the two recipients, including other tabs.
+        // User-wide channels would leak reserved room events into another city.
+        for (const targetId of io.sockets.adapter.rooms.get(`room:${room.id}`) ?? []) {
+          const target = io.sockets.sockets.get(targetId);
+          if (target && [user.id, recipientId].includes(target.data.user?.id)) target.emit('room:message:new', { ...message, user: { id: user.id, profile: user.profile }, recipient, blockedForMe: false });
         }
-        ack?.({ ok: true });
-      } catch { ack?.({ error: 'Não foi possível enviar a mensagem.' }); }
+      } else {
+        const message = await prisma.roomMessage.create({ data: { roomId: room.id, userId: user.id, scope: 'PUBLIC', content: parsed.content } });
+        const blockers = new Set((await prisma.userBlock.findMany({ where: { blockedUserId: user.id }, select: { blockerId: true } })).map(item => item.blockerId));
+        for (const targetId of io.sockets.adapter.rooms.get(`room:${room.id}`) ?? []) {
+          const target = io.sockets.sockets.get(targetId);
+          target?.emit('room:message:new', { ...message, user: { id: user.id, profile: user.profile }, recipient: null, blockedForMe: blockers.has(target.data.user?.id) });
+        }
+      }
+      ack({ ok: true });
     });
 
     socket.on('private:invite', async (input, ack) => {
       try {
         const invitedUserId = typeof input?.invitedUserId === 'string' ? input.invitedUserId : '';
         const invited = await prisma.user.findUnique({ where: { id: invitedUserId }, include: { profile: true } });
-        if (!invited?.profile || invited.id === user.id || invited.profile.cityId !== user.profile.cityId || invited.profile.invitationPreference === 'NONE' || await isBlockedEitherWay(user.id, invited.id)) return ack?.({ error: 'Convite indisponível.' });
+        if (!invited?.profile || invited.status !== 'ACTIVE' || invited.id === user.id || invited.profile.invitationPreference === 'NONE' || await isBlockedEitherWay(user.id, invited.id)) return ack?.({ error: 'Convite indisponível.' });
+        // Preserve existing same-profile-city invitations; visitors from another
+        // city may invite each other only when they meet in the same active room.
+        if (invited.profile.cityId !== user.profile.cityId) {
+          const sharedRoom = [...socket.rooms].find(name => name.startsWith('room:') && [...(presence.get(name.slice(5))?.values() ?? [])].some(person => person.userId === invited.id));
+          if (!sharedRoom || !await findActiveRoom(sharedRoom.slice(5))) return ack?.({ error: 'Entre na mesma sala para enviar este convite.' });
+        }
         if (invited.profile.invitationPreference === 'VERIFIED_ONLY' && !user.emailVerifiedAt) return ack?.({ error: 'Apenas contas confirmadas.' });
         const [participantOneId, participantTwoId] = canonicalPair(user.id, invited.id);
         const conversation = await prisma.$transaction(async tx => {
@@ -155,9 +208,7 @@ export function configureSocket(io: Server) {
 
     socket.on('disconnecting', () => {
       for (const roomName of socket.rooms) if (roomName.startsWith('room:')) {
-        const id = roomName.slice(5); const list = presence.get(id); list?.delete(socket.id);
-        if (list?.size === 0) presence.delete(id);
-        io.to(roomName).emit('room:participants', [...new Map([...(list?.values() ?? [])].map(person => [person.userId, person])).values()]);
+        removePresence(roomName.slice(5));
       }
     });
   });

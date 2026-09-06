@@ -17,3 +17,6 @@ export const profileSchema = z.object({
   interests: z.array(z.string().trim().min(1).max(30)).max(8).default([])
 }).refine(v => !/(admin|administrador|moderador|suporte|oficial)/i.test(v.nickname), { message: 'Apelido reservado.' });
 export const messageSchema = z.object({ content: z.string().trim().min(1).max(500) });
+export const roomMessageSchema = messageSchema.extend({
+  roomId: z.string().min(1).max(100), recipientId: z.string().min(1).max(100).optional()
+}).strict();

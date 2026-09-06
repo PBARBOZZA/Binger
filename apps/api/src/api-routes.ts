@@ -12,6 +12,7 @@ import {
   readAuthorizedPrivateMedia
 } from './private-media.js';
 import { emitPrivateEvent } from './private-events.js';
+import { findActiveRoom, publicRoomSelect, roomView } from './rooms.js';
 
 export const apiRouter = Router();
 apiRouter.get('/cities', async (_req, res) => {
@@ -19,9 +20,20 @@ apiRouter.get('/cities', async (_req, res) => {
   res.json(cities.map(city => ({ ...city, onlineCount: 0 })));
 });
 
+apiRouter.get('/rooms', requireAuth, async (_req, res) => {
+  const rooms = await prisma.room.findMany({ where: { active: true, city: { active: true } }, select: publicRoomSelect, orderBy: [{ city: { name: 'asc' } }, { name: 'asc' }, { id: 'asc' }] });
+  res.json(rooms.map(roomView));
+});
+apiRouter.get('/rooms/:id', requireAuth, async (req, res) => {
+  const room = await findActiveRoom(req.params.id);
+  if (!room) return res.status(404).json({ error: 'Sala indisponível.' });
+  res.json(roomView(room));
+});
 apiRouter.get('/rooms/:id/messages', requireAuth, async (req, res) => {
   const userId = req.auth!.userId;
-  const room = await prisma.room.findFirst({ where: { id: String(req.params.id), active: true, city: { active: true, profiles: { some: { userId } } } } });
+  const profileOwner = await prisma.user.findFirst({ where: { id: userId, profile: { isNot: null } }, select: { id: true } });
+  if (!profileOwner) return res.status(403).json({ error: 'Complete seu perfil antes de entrar no chat.' });
+  const room = await findActiveRoom(req.params.id);
   if (!room) return res.status(404).json({ error: 'Sala indisponível.' });
   const [messages, blocks] = await Promise.all([
     prisma.roomMessage.findMany({ where: { roomId: room.id, deletedAt: null, moderationStatus: 'VISIBLE', OR: [{ scope: 'PUBLIC' }, { userId }, { recipientId: userId }] }, include: { user: { select: { id: true, profile: true } }, recipient: { select: { id: true, profile: true } } }, orderBy: { createdAt: 'desc' }, take: 50 }),

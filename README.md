@@ -4,6 +4,8 @@ MVP de uma praça digital regional anônima, exclusiva para maiores de 18 anos. 
 
 ## Arquitetura
 
+Salas por cidade/estado: veja [modelo, migração e operação das salas regionais](docs/regional-rooms.md).
+
 - `apps/web`: React 19, TypeScript, Vite, React Router, Socket.IO Client e PWA.
 - `apps/api`: Express 5, Prisma/PostgreSQL, Argon2id, cookies HttpOnly e Socket.IO.
 - PostgreSQL separa conta privada, perfil público, conteúdo, moderação, sessão e auditoria.
