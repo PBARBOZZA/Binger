@@ -17,7 +17,8 @@ async function prepare() {
 const migrationSql = (name: string) => readFile(new URL(`${name}/migration.sql`, migrations), 'utf8');
 const repair = '20260907120000_repair_regional_rooms';
 const order = '20260907121000_room_message_order';
-const sql = async () => (await Promise.all([regionalMigration, repair, order].map(migrationSql))).join('\n');
+const cityRepair = '20260908120000_repair_regional_city_alias';
+const sql = async () => (await Promise.all((await readdir(migrations)).filter(name => /^\d/.test(name) && name >= regionalMigration).sort().map(migrationSql))).join('\n');
 // Exercise the real seed algorithm on PostgreSQL, through only its used Prisma operations.
 function seedDatabase(db: PGlite) {
   return seedRegionalRooms({
@@ -25,17 +26,25 @@ function seedDatabase(db: PGlite) {
       const one = async (sql: string, args: any[]) => (await tx.query(sql, args)).rows[0];
       return callback({
         $executeRawUnsafe: (sql: string) => tx.exec(sql),
-        city: { upsert: async ({ where, create }: any) => {
+        city: {
+          findUnique: ({ where }: any) => one('SELECT * FROM "City" WHERE slug = $1', [where.slug]),
+          count: async ({ where }: any) => Number((await one('SELECT count(*) AS n FROM "City" WHERE name = $1 AND state = $2 AND NOT (slug = ANY($3::text[]))', [where.name, where.state, where.slug.notIn]) as any).n),
+          update: ({ where, data }: any) => one('UPDATE "City" SET active = $1 WHERE id = $2 RETURNING *', [data.active, where.id]),
+          upsert: async ({ where, create }: any) => {
           await tx.query('INSERT INTO "City" (id, name, state, slug) VALUES ($1, $2, $3, $4) ON CONFLICT (slug) DO NOTHING', [`seed-${create.slug}`, create.name, create.state, create.slug]);
           return one('SELECT * FROM "City" WHERE slug = $1', [where.slug]);
         } },
         room: {
           findMany: async ({ where }: any) => (await tx.query('SELECT * FROM "Room" WHERE "cityId" = $1', [where.cityId])).rows,
-          findUnique: ({ where }: any) => one('SELECT * FROM "Room" WHERE "publicSlug" = $1', [where.publicSlug]),
-          update: ({ where, data }: any) => one('UPDATE "Room" SET "publicSlug" = $1, active = COALESCE($2, active) WHERE id = $3 RETURNING *', [data.publicSlug, data.active ?? null, where.id]),
+          findUnique: ({ where }: any) => where.cityId_slug
+            ? one('SELECT * FROM "Room" WHERE "cityId" = $1 AND slug = $2', [where.cityId_slug.cityId, where.cityId_slug.slug])
+            : one('SELECT * FROM "Room" WHERE "publicSlug" = $1', [where.publicSlug]),
+          count: async ({ where }: any) => Number((await one('SELECT count(*) AS n FROM "Room" WHERE "cityId" = $1 AND id <> $2', [where.cityId, where.id.not]) as any).n),
+          update: ({ where, data }: any) => one('UPDATE "Room" SET "publicSlug" = $1, active = COALESCE($2, active), "updatedAt" = clock_timestamp() WHERE id = $3 RETURNING *', [data.publicSlug, data.active ?? null, where.id]),
           create: ({ data }: any) => one('INSERT INTO "Room" (id, "cityId", name, slug, "publicSlug") VALUES ($1, $2, $3, $4, $5) RETURNING *', [`seed-room-${data.cityId}`, data.cityId, data.name, data.slug, data.publicSlug])
         },
-        roomMessage: { count: async ({ where }: any) => Number((await one('SELECT count(*) AS n FROM "RoomMessage" WHERE "roomId" = $1', [where.roomId]) as any).n) }
+        roomMessage: { count: async ({ where }: any) => Number((await one('SELECT count(*) AS n FROM "RoomMessage" WHERE "roomId" = $1', [where.roomId]) as any).n) },
+        userProfile: { count: async ({ where }: any) => Number((await one('SELECT count(*) AS n FROM "UserProfile" WHERE "cityId" = $1', [where.cityId]) as any).n) }
       });
     })
   } as unknown as PrismaClient);
@@ -56,13 +65,14 @@ describe('migração regional em PostgreSQL isolado (PGlite)', () => {
     return db;
   }
 
-  it('reproduz as 24 mensagens da VPS, corrige somente o endereço e mantém a duplicata desativada após repetir seed', async () => {
+  it('corrige o legado geral dentro da mesma cidade e mantém a duplicata desativada após repetir seed', async () => {
     const db = await legacyDatabase();
     try {
       const before = (await db.query('SELECT * FROM "RoomMessage" ORDER BY id')).rows;
       expect((await db.query('SELECT "publicSlug" FROM "Room" WHERE id = \'original-id\'')).rows).toEqual([{ publicSlug: null }]);
       await db.exec(await migrationSql(repair));
       await db.exec(await migrationSql(order));
+      await db.exec(await migrationSql(cityRepair));
       await seedDatabase(db); await seedDatabase(db);
       expect((await db.query('SELECT id, slug, name, "publicSlug", active FROM "Room" WHERE "cityId" = \'city-to\' ORDER BY slug')).rows).toEqual([
         { id: 'cregionalroomteofilootoni', slug: 'conversa-geral', name: 'Conversa Geral', publicSlug: null, active: false },
@@ -174,6 +184,113 @@ describe('migração regional em PostgreSQL isolado (PGlite)', () => {
       await db.exec('ROLLBACK');
       expect((await db.query(`SELECT column_name FROM information_schema.columns WHERE table_name = 'Room' AND column_name = 'publicSlug'`)).rows).toEqual([]);
       expect((await db.query('SELECT "id" FROM "City"')).rows).toEqual([{ id: 'unexpected' }]);
+    } finally { await db.close(); }
+  }, 30_000);
+});
+
+
+describe('correção entre cidades com IDs distintos — cenário real da VPS', () => {
+  async function vpsDatabase() {
+    const db = await prepare();
+    await db.exec(`
+      INSERT INTO "City" (id, name, state, slug) VALUES
+        ('original-city-id', 'Teófilo Otoni', 'MG', 'teofilo-otoni-mg'),
+        ('original-mucuri-id', 'Mucuri', 'BA', 'mucuri');
+      INSERT INTO "Room" (id, "cityId", name, slug) VALUES
+        ('original-room-id', 'original-city-id', 'Sala Geral', 'geral'),
+        ('original-mucuri-room', 'original-mucuri-id', 'Conversa Geral', 'conversa-geral');
+      INSERT INTO "User" (id, email, "passwordHash", "birthDate", "updatedAt") VALUES
+        ('a', 'a@example.test', 'synthetic', '1990-01-01', NOW()), ('b', 'b@example.test', 'synthetic', '1990-01-01', NOW());
+      INSERT INTO "UserProfile" (id, "userId", "cityId", nickname, "ageRange", interests, "updatedAt") VALUES
+        ('original-profile', 'a', 'original-city-id', 'A', '25–34', '{}', NOW()),
+        ('mucuri-profile', 'b', 'original-mucuri-id', 'B', '25–34', '{}', NOW());
+      INSERT INTO "RoomMessage" (id, "roomId", "userId", content)
+        SELECT 'legacy-' || i, 'original-room-id', 'a', 'mensagem ' || i FROM generate_series(1,24) i;
+      INSERT INTO "RoomMessage" (id, "roomId", "userId", content) VALUES ('mucuri-message', 'original-mucuri-room', 'b', 'preservar Mucuri');
+      INSERT INTO "PrivateConversation" (id, "participantOneId", "participantTwoId", "requestedById", status)
+        VALUES ('private', 'a', 'b', 'a', 'ACCEPTED');
+      INSERT INTO "PrivateMessage" (id, "conversationId", "senderId", kind, content)
+        VALUES ('private-message', 'private', 'a', 'IMAGE', '');
+      INSERT INTO "PrivateMedia" (id, "conversationId", "messageId", "authorId", "storageKey", "mimeType", "byteSize", width, height, "expiresAt")
+        VALUES ('private-media', 'private', 'private-message', 'a', 'opaque-key', 'image/webp', 100, 10, 10, NOW() + INTERVAL '1 day');
+    `);
+    const history = await snapshot(db, ['User', 'UserProfile', 'RoomMessage', 'PrivateConversation', 'PrivateMessage', 'PrivateMedia']);
+    for (const migration of [regionalMigration, repair, order]) await db.exec(await migrationSql(migration));
+    // Prove the old repair completed without repairing this real scenario.
+    expect((await db.query('SELECT "publicSlug" FROM "Room" WHERE id = \'original-room-id\'')).rows).toEqual([{ publicSlug: null }]);
+    expect((await db.query('SELECT r.id, r."cityId", r.active, r."publicSlug" FROM "Room" r WHERE r.id = \'cregionalroomteofilootoni\'')).rows).toEqual([
+      { id: 'cregionalroomteofilootoni', cityId: 'cregionalteofilootonimg001', active: true, publicSlug: 'teofilo-otoni-mg' }
+    ]);
+    for (const [table, rows] of Object.entries(history)) expect(withoutPosition((await db.query(`SELECT * FROM "${table}" ORDER BY id`)).rows)).toEqual(rows);
+    return db;
+  }
+
+  async function snapshot(db: PGlite, tables = ['City', 'Room', 'User', 'UserProfile', 'RoomMessage', 'PrivateConversation', 'PrivateMessage', 'PrivateMedia']) {
+    return Object.fromEntries(await Promise.all(tables.map(async table => [table, (await db.query(`SELECT * FROM "${table}" ORDER BY id`)).rows])));
+  }
+
+  it.each(['migration', 'seed'])('preserva as 24 mensagens e todos os vínculos; %s primeiro, sequência completa e seed repetido', async first => {
+    const db = await vpsDatabase();
+    try {
+      const before = await snapshot(db);
+      if (first === 'seed') await seedDatabase(db);
+      await db.exec(await migrationSql(cityRepair));
+      const after = await snapshot(db);
+      await seedDatabase(db); await seedDatabase(db);
+      expect(await snapshot(db)).toEqual(after);
+      for (const table of ['User', 'UserProfile', 'RoomMessage', 'PrivateConversation', 'PrivateMessage', 'PrivateMedia']) expect(after[table]).toEqual(before[table]);
+      expect(after.City).toEqual(before.City.map((city: any) => city.id === 'cregionalteofilootonimg001' ? { ...city, active: false } : city));
+      const originalBefore = before.Room.find((room: any) => room.id === 'original-room-id');
+      expect(after.Room.find((room: any) => room.id === 'original-room-id')).toEqual({ ...originalBefore, publicSlug: 'teofilo-otoni-mg', updatedAt: expect.any(Date) });
+      expect(after.Room.find((room: any) => room.id === 'original-mucuri-room')).toEqual(before.Room.find((room: any) => room.id === 'original-mucuri-room'));
+      expect(after.Room.find((room: any) => room.id === 'cregionalroomteofilootoni')).toMatchObject({ cityId: 'cregionalteofilootonimg001', slug: 'conversa-geral', active: false, publicSlug: null });
+      expect((await db.query('SELECT count(*)::int AS n FROM "RoomMessage" WHERE "roomId" = \'original-room-id\'')).rows).toEqual([{ n: 24 }]);
+      expect((await db.query('SELECT c.id AS "cityId", c.slug AS "citySlug", r.id, r.slug, r."publicSlug" FROM "City" c JOIN "Room" r ON r."cityId" = c.id WHERE c.active AND r.active ORDER BY c.slug')).rows).toEqual([
+        { cityId: 'original-mucuri-id', citySlug: 'mucuri', id: 'original-mucuri-room', slug: 'conversa-geral', publicSlug: 'mucuri-ba' },
+        { cityId: 'original-city-id', citySlug: 'teofilo-otoni-mg', id: 'original-room-id', slug: 'geral', publicSlug: 'teofilo-otoni-mg' }
+      ]);
+      await expect(db.exec(`UPDATE "Room" SET "publicSlug" = 'teofilo-otoni-mg' WHERE id = 'cregionalroomteofilootoni'`)).rejects.toThrow(/unique/i);
+    } finally { await db.close(); }
+  }, 30_000);
+
+  it('preserva a desativação original e salas legítimas vinculadas à cidade original', async () => {
+    const db = await vpsDatabase();
+    try {
+      await db.exec(`UPDATE "City" SET active = false WHERE id = 'original-city-id'; UPDATE "Room" SET active = false WHERE id = 'original-room-id';
+        INSERT INTO "Room" (id, "cityId", name, slug) VALUES ('legitimate-original', 'original-city-id', 'Cultura', 'cultura')`);
+      await db.exec(await migrationSql(cityRepair));
+      const after = await snapshot(db);
+      await seedDatabase(db); await seedDatabase(db);
+      expect(await snapshot(db)).toEqual(after);
+      expect(after.City.find((city: any) => city.id === 'original-city-id')).toMatchObject({ active: false });
+      expect(after.Room.find((room: any) => room.id === 'original-room-id')).toMatchObject({ active: false, publicSlug: 'teofilo-otoni-mg' });
+      expect(after.Room.find((room: any) => room.id === 'legitimate-original')).toMatchObject({ active: true, cityId: 'original-city-id' });
+    } finally { await db.close(); }
+  }, 30_000);
+
+  it.each([
+    ['mensagem visível', `INSERT INTO "RoomMessage" (id, "roomId", "userId", content) VALUES ('conflict', 'cregionalroomteofilootoni', 'a', 'preservar')`, /contains messages/],
+    ['mensagem excluída', `INSERT INTO "RoomMessage" (id, "roomId", "userId", content, "deletedAt") VALUES ('conflict', 'cregionalroomteofilootoni', 'a', 'preservar', NOW())`, /contains messages/],
+    ['mensagem moderada', `INSERT INTO "RoomMessage" (id, "roomId", "userId", content, "moderationStatus") VALUES ('conflict', 'cregionalroomteofilootoni', 'a', 'preservar', 'HIDDEN')`, /contains messages/],
+    ['perfil na duplicata', `UPDATE "UserProfile" SET "cityId" = 'cregionalteofilootonimg001' WHERE id = 'mucuri-profile'`, /has profiles/],
+    ['outra sala ativa', `INSERT INTO "Room" (id, "cityId", name, slug) VALUES ('legitimate', 'cregionalteofilootonimg001', 'Cultura', 'cultura')`, /has other rooms/],
+    ['outra sala inativa', `INSERT INTO "Room" (id, "cityId", name, slug, active) VALUES ('legitimate', 'cregionalteofilootonimg001', 'Cultura', 'cultura', false)`, /has other rooms/],
+    ['identidade da cidade duplicada', `UPDATE "City" SET name = 'Outra cidade' WHERE id = 'cregionalteofilootonimg001'`, /duplicate city identity/],
+    ['identidade da sala duplicada', `UPDATE "Room" SET id = 'unexpected-room-id' WHERE id = 'cregionalroomteofilootoni'`, /unexpected duplicate room/],
+    ['identidade da cidade original', `UPDATE "City" SET state = 'BA' WHERE id = 'original-city-id'`, /ambiguous original city/],
+    ['sala original ausente', `UPDATE "Room" SET slug = 'another' WHERE id = 'original-room-id'`, /ambiguous original Sala Geral/],
+    ['terceira cidade', `INSERT INTO "City" (id, name, state, slug) VALUES ('third', 'Teófilo Otoni', 'MG', 'another')`, /additional city/],
+    ['endereço ocupado', `UPDATE "Room" SET "publicSlug" = NULL, active = false WHERE id = 'cregionalroomteofilootoni'; UPDATE "Room" SET "publicSlug" = 'teofilo-otoni-mg' WHERE id = 'original-mucuri-room'`, /public address conflict/]
+  ])('interrompe por %s e reverte integralmente migration e seed', async (_label, change, error) => {
+    const db = await vpsDatabase();
+    try {
+      await db.exec(change as string);
+      const before = await snapshot(db);
+      await expect(db.exec(await migrationSql(cityRepair))).rejects.toThrow(error as RegExp);
+      await db.exec('ROLLBACK');
+      expect(await snapshot(db)).toEqual(before);
+      await expect(seedDatabase(db)).rejects.toThrow(/Seed regional/);
+      expect(await snapshot(db)).toEqual(before);
     } finally { await db.close(); }
   }, 30_000);
 });

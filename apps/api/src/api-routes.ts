@@ -17,7 +17,18 @@ import { getParticipation, roomMessageView } from './room-participation.js';
 
 export const apiRouter = Router();
 apiRouter.get('/cities', async (_req, res) => {
-  const cities = await prisma.city.findMany({ where: { active: true }, include: { rooms: { where: { active: true }, select: { id: true, name: true, slug: true } } }, orderBy: { name: 'asc' } });
+  // Catalog follows persisted city/room identities, including the original
+  // teofilo-otoni-mg city. Do not reconstruct IDs from a regional alias.
+  const cities = await prisma.city.findMany({
+    where: { active: true },
+    include: { rooms: {
+      where: { active: true }, select: { id: true, name: true, slug: true, publicSlug: true },
+      // Auth enters rooms[0]; prefer the public regional address over an
+      // unrelated local room, regardless of insertion order or legacy slug.
+      orderBy: [{ publicSlug: { sort: 'asc', nulls: 'last' } }, { id: 'asc' }]
+    } },
+    orderBy: [{ name: 'asc' }, { state: 'asc' }, { id: 'asc' }]
+  });
   res.json(cities.map(city => ({ ...city, onlineCount: 0 })));
 });
 

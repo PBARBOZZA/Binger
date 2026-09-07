@@ -2,7 +2,7 @@ import { prisma } from './db.js';
 
 export const publicRoomSelect = {
   id: true, name: true, publicSlug: true, active: true, createdAt: true, updatedAt: true,
-  city: { select: { id: true, name: true, state: true } }
+  city: { select: { id: true, slug: true, name: true, state: true } }
 } as const;
 
 // Explicit room required: never silently fall back to the first/default city.
@@ -17,7 +17,7 @@ export function findActiveRoom(reference: unknown) {
 export function roomView(room: NonNullable<Awaited<ReturnType<typeof findActiveRoom>>>) {
   return {
     id: room.id, slug: room.publicSlug ?? room.id, name: room.name,
-    cityId: room.city.id, city: room.city.name, state: room.city.state,
+    cityId: room.city.id, citySlug: room.city.slug, city: room.city.name, state: room.city.state,
     isActive: room.active, createdAt: room.createdAt, updatedAt: room.updatedAt
   };
 }
