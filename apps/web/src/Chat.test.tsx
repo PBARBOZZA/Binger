@@ -25,7 +25,10 @@ const mocks = vi.hoisted(() => ({
   handlers: new Map<string, (payload?: unknown) => void>(),
   emit: vi.fn(),
   disconnect: vi.fn(),
-  joinError: ''
+  joinError: '',
+  visitPrefix: 'visit',
+  deferJoin: false,
+  pendingJoin: undefined as undefined | (() => void)
 }));
 
 vi.mock('./api', () => ({
@@ -47,7 +50,11 @@ vi.mock('socket.io-client', () => ({
       mocks.emit(event, ...args);
       const callback = args.at(-1);
       if (typeof callback !== 'function') return;
-      if (event === 'room:join') callback(mocks.joinError ? { error: mocks.joinError } : { ok: true, roomId: args[0] });
+      if (event === 'room:join') {
+        const reply = () => callback(mocks.joinError ? { error: mocks.joinError } : { ok: true, roomId: args[0], participationId: `${mocks.visitPrefix}-${args[0]}` });
+        if (mocks.deferJoin) mocks.pendingJoin = reply;
+        else reply();
+      }
       else if (event === 'private:join') callback({ ok: true });
       else callback({ ok: true });
     },
@@ -56,7 +63,7 @@ vi.mock('socket.io-client', () => ({
 }));
 
 const rooms = [
-  { id: 'room-1', slug: 'teofilo-otoni-mg', name: 'Conversa Geral', city: 'Teófilo Otoni', state: 'MG', isActive: true },
+  { id: 'room-1', slug: 'teofilo-otoni-mg', name: 'Sala Geral', city: 'Teófilo Otoni', state: 'MG', isActive: true },
   { id: 'room-2', slug: 'mucuri-ba', name: 'Conversa Geral', city: 'Mucuri', state: 'BA', isActive: true }
 ];
 
@@ -82,6 +89,7 @@ function renderChat(path = '/sala/room-1') {
 
 beforeEach(() => {
   mocks.joinError = '';
+  mocks.visitPrefix = 'visit'; mocks.deferJoin = false; mocks.pendingJoin = undefined;
   mocks.api.mockReset();
   mocks.uploadPrivateImage.mockReset();
   mocks.fetchPrivateImage.mockReset();
@@ -105,7 +113,7 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe('salas regionais', () => {
-  const message = (id: string, roomId: string, content: string) => ({ id, roomId, content, createdAt: '2026-09-05T12:00:00Z', user: other, scope: 'PUBLIC' });
+  const message = (id: string, roomId: string, content: string) => ({ id, roomId, participationId: `visit-${roomId}`, content, createdAt: '2026-09-05T12:00:00Z', user: other, scope: 'PUBLIC' });
   function regionalApi(history: (path: string) => Promise<unknown>) {
     mocks.api.mockImplementation((path: string) => {
       if (path === '/auth/me') return Promise.resolve(me);
@@ -114,6 +122,28 @@ describe('salas regionais', () => {
       return history(path);
     });
   }
+
+  it('só mostra mensagens da participação confirmada e guarda eventos anteriores ao ack sem duplicar', async () => {
+    mocks.deferJoin = true;
+    const current = message('current', 'room-1', 'Enviada durante meu ingresso');
+    const old = { ...message('old', 'room-1', 'Histórico de quem já saiu'), participationId: 'old-visit' };
+    regionalApi(() => Promise.resolve([old, current]));
+    renderChat('/sala/teofilo-otoni-mg');
+    await waitFor(() => expect(mocks.pendingJoin).toBeDefined());
+    expect(screen.getByRole('combobox', { name: 'Cidade e estado' })).toHaveValue('room-1');
+    expect(screen.getByRole('option', { name: 'Teófilo Otoni - MG · Sala Geral' })).toBeInTheDocument();
+    act(() => {
+      mocks.handlers.get('room:message:new')?.(old);
+      mocks.handlers.get('room:message:new')?.(current);
+    });
+    expect(screen.queryByText('Histórico de quem já saiu')).not.toBeInTheDocument();
+    expect(screen.queryByText('Enviada durante meu ingresso')).not.toBeInTheDocument();
+    await act(async () => mocks.pendingJoin?.());
+    expect(screen.getAllByText('Enviada durante meu ingresso')).toHaveLength(1);
+    expect(screen.queryByText('Histórico de quem já saiu')).not.toBeInTheDocument();
+    act(() => mocks.handlers.get('room:presence')?.({ roomId: 'room-1', participants: [] }));
+    expect(screen.getByText('Enviada durante meu ingresso')).toBeInTheDocument();
+  });
 
   it('troca cidade com histórico correto, limpa rascunho e ignora eventos de outra sala', async () => {
     const user = userEvent.setup();
@@ -138,7 +168,7 @@ describe('salas regionais', () => {
     let resolveOld!: (messages: unknown[]) => void;
     regionalApi(path => path.includes('room-1') ? new Promise(resolve => { resolveOld = resolve; }) : Promise.resolve([message('ba', 'room-2', 'Histórico BA')]));
     const user = userEvent.setup(); renderChat();
-    await waitFor(() => expect(mocks.api).toHaveBeenCalledWith('/rooms/room-1/messages'));
+    await waitFor(() => expect(mocks.api).toHaveBeenCalledWith('/rooms/room-1/messages', { headers: { 'X-Room-Participation': 'visit-room-1' } }));
     expect(screen.getByRole('button', { name: 'Enviar mensagem' })).toBeDisabled();
     await user.selectOptions(screen.getByRole('combobox', { name: 'Cidade e estado' }), 'room-2');
     await screen.findByText('Histórico BA');
@@ -147,20 +177,27 @@ describe('salas regionais', () => {
     expect(screen.getByRole('button', { name: 'Enviar mensagem' })).toBeEnabled();
   });
 
-  it('preserva mensagens recebidas enquanto carrega histórico e sincroniza na reconexão', async () => {
+  it('deduplica mensagens do ingresso e inicia tela vazia com nova participação na reconexão', async () => {
     let resolveHistory!: (messages: unknown[]) => void;
     regionalApi(() => new Promise(resolve => { resolveHistory = resolve; }));
     renderChat();
-    await waitFor(() => expect(mocks.api).toHaveBeenCalledWith('/rooms/room-1/messages'));
+    await waitFor(() => expect(mocks.api).toHaveBeenCalledWith('/rooms/room-1/messages', { headers: { 'X-Room-Participation': 'visit-room-1' } }));
     const live = message('live', 'room-1', 'Durante histórico');
     act(() => mocks.handlers.get('room:message:new')?.(live));
     await act(async () => resolveHistory([message('old', 'room-1', 'Antiga'), live]));
     expect(screen.getAllByText('Durante histórico')).toHaveLength(1);
     act(() => mocks.handlers.get('disconnect')?.());
     expect(screen.getByRole('button', { name: 'Enviar mensagem' })).toBeDisabled();
+    expect(screen.queryByText('Durante histórico')).not.toBeInTheDocument();
+    mocks.visitPrefix = 'fresh';
     act(() => mocks.handlers.get('connect')?.());
-    await act(async () => resolveHistory([message('missed', 'room-1', 'Recebida offline')]));
-    expect(await screen.findByText('Recebida offline')).toBeInTheDocument();
+    act(() => mocks.handlers.get('room:message:new')?.(live));
+    await act(async () => resolveHistory([live]));
+    expect(screen.queryByText('Durante histórico')).not.toBeInTheDocument();
+    const fresh = { ...message('fresh', 'room-1', 'Nova participação'), participationId: 'fresh-room-1' };
+    act(() => mocks.handlers.get('room:message:new')?.(fresh));
+    expect(await screen.findByText('Nova participação')).toBeInTheDocument();
+    expect(mocks.api).toHaveBeenLastCalledWith('/rooms/room-1/messages', { headers: { 'X-Room-Participation': 'fresh-room-1' } });
     expect(mocks.api.mock.calls.filter(([path]) => path === '/rooms/room-1/messages')).toHaveLength(2);
   });
 
@@ -169,7 +206,7 @@ describe('salas regionais', () => {
     renderChat();
     await screen.findByText('Sala indisponível.');
     expect(screen.getByRole('button', { name: 'Enviar mensagem' })).toBeDisabled();
-    expect(mocks.api).not.toHaveBeenCalledWith('/rooms/room-1/messages');
+    expect(mocks.api).not.toHaveBeenCalledWith('/rooms/room-1/messages', { headers: { 'X-Room-Participation': 'visit-room-1' } });
     cleanup(); mocks.joinError = '';
     regionalApi(() => Promise.reject(new Error('Histórico indisponível.')));
     renderChat();

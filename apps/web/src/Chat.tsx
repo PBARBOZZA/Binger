@@ -19,6 +19,7 @@ type ChatMessage = {
   scope?: 'PUBLIC' | 'RESERVED';
   blockedForMe?: boolean;
   roomId?: string;
+  participationId?: string;
   conversationId?: string;
   kind?: 'TEXT' | 'IMAGE';
   media?: PrivateMedia | null;
@@ -36,7 +37,7 @@ type Conversation = {
 type InviteEvent = { conversation: Conversation; from: User };
 type PrivateMediaEvent = { message: ChatMessage; media: PrivateMedia };
 type ImageUploadResponse = { message: ChatMessage; media: PrivateMedia };
-type SocketAck = { ok?: boolean; error?: string; roomId?: string };
+type SocketAck = { ok?: boolean; error?: string; roomId?: string; participationId?: string };
 type PendingImage = { file: File; url: string };
 
 const color = (id: string) => `hsl(${[...id].reduce((n, c) => n + c.charCodeAt(0), 0) % 360} 48% 42%)`;
@@ -181,6 +182,7 @@ export function Chat() {
     let bufferedMessages: ChatMessage[] = [];
     let connectionVersion = 0;
     let fetchingHistory = false;
+    let participationId: string | null = null;
     setTransportStatus('connecting');
     const socket = io(API_URL, { withCredentials: true });
     socketRef.current = socket;
@@ -188,21 +190,24 @@ export function Chat() {
       setTransportStatus('online');
       const version = ++connectionVersion;
       bufferedMessages = [];
+      participationId = null;
+      setRoomMessages([]);
       fetchingHistory = true;
       setRoomLoading(Boolean(selectedRoomId));
       setHistoryRoomId(null);
       if (selectedRoomId) socket.emit('room:join', selectedRoomId, async (reply: SocketAck | undefined) => {
         if (!active || version !== connectionVersion) return;
-        if (!reply?.ok || reply.roomId !== selectedRoomId) {
+        if (!reply?.ok || reply.roomId !== selectedRoomId || !reply.participationId) {
           setRoomError(reply?.error ?? 'Não foi possível entrar na sala.');
           setRoomLoading(false);
           return;
         }
+        participationId = reply.participationId;
         setJoinedRoomId(selectedRoomId);
         try {
-          const history = await api<ChatMessage[]>(`/rooms/${encodeURIComponent(selectedRoomId)}/messages`);
+          const history = await api<ChatMessage[]>(`/rooms/${encodeURIComponent(selectedRoomId)}/messages`, { headers: { 'X-Room-Participation': participationId } });
           if (!active || version !== connectionVersion) return;
-          setRoomMessages(bufferedMessages.reduce(upsertMessage, history.filter(message => message.roomId === selectedRoomId)));
+          setRoomMessages(bufferedMessages.filter(message => message.participationId === participationId).reduce(upsertMessage, history.filter(message => message.roomId === selectedRoomId && message.participationId === participationId)));
           bufferedMessages = [];
           setHistoryRoomId(selectedRoomId);
           setRoomError('');
@@ -218,12 +223,24 @@ export function Chat() {
     socket.on('connect_error', () => setTransportStatus('offline'));
     socket.on('disconnect', () => {
       ++connectionVersion;
+      participationId = null;
+      bufferedMessages = [];
+      setRoomMessages([]);
+      setHistoryRoomId(null);
+      setPeople([]);
       setTransportStatus('offline');
       setJoinedRoomId(null);
       setPrivateJoined(false);
     });
     socket.on('room:message:new', (message: ChatMessage) => {
-      if (!active || message.roomId !== selectedRoomId) return;
+      if (!active || message.roomId !== selectedRoomId || !message.participationId) return;
+      // Frames may precede the join acknowledgement. Keep them until its token
+      // is known; never display a frame from an older visit to the same room.
+      if (!participationId) {
+        if (fetchingHistory) bufferedMessages = upsertMessage(bufferedMessages, message);
+        return;
+      }
+      if (message.participationId !== participationId) return;
       if (fetchingHistory) bufferedMessages = upsertMessage(bufferedMessages, message);
       setRoomMessages(current => upsertMessage(current, message));
     });
@@ -247,6 +264,7 @@ export function Chat() {
     });
     return () => {
       active = false;
+      socket.emit('room:leave', null);
       socket.disconnect();
       if (socketRef.current === socket) socketRef.current = null;
     };

@@ -13,6 +13,7 @@ import {
 } from './private-media.js';
 import { emitPrivateEvent } from './private-events.js';
 import { findActiveRoom, publicRoomSelect, roomView } from './rooms.js';
+import { getParticipation, roomMessageView } from './room-participation.js';
 
 export const apiRouter = Router();
 apiRouter.get('/cities', async (_req, res) => {
@@ -30,17 +31,21 @@ apiRouter.get('/rooms/:id', requireAuth, async (req, res) => {
   res.json(roomView(room));
 });
 apiRouter.get('/rooms/:id/messages', requireAuth, async (req, res) => {
+  res.setHeader('Cache-Control', 'no-store');
   const userId = req.auth!.userId;
   const profileOwner = await prisma.user.findFirst({ where: { id: userId, profile: { isNot: null } }, select: { id: true } });
   if (!profileOwner) return res.status(403).json({ error: 'Complete seu perfil antes de entrar no chat.' });
   const room = await findActiveRoom(req.params.id);
   if (!room) return res.status(404).json({ error: 'Sala indisponível.' });
+  const participation = getParticipation(req.get('X-Room-Participation'), req.auth!.sessionId, userId, room.id);
+  if (!participation) return res.status(403).json({ error: 'Entre novamente na sala para visualizar mensagens.' });
   const [messages, blocks] = await Promise.all([
-    prisma.roomMessage.findMany({ where: { roomId: room.id, deletedAt: null, moderationStatus: 'VISIBLE', OR: [{ scope: 'PUBLIC' }, { userId }, { recipientId: userId }] }, include: { user: { select: { id: true, profile: true } }, recipient: { select: { id: true, profile: true } } }, orderBy: { createdAt: 'desc' }, take: 50 }),
+    prisma.roomMessage.findMany({ where: { roomId: room.id, position: { gt: participation.after }, deletedAt: null, moderationStatus: 'VISIBLE', OR: [{ scope: 'PUBLIC' }, { userId }, { recipientId: userId }] }, include: { user: { select: { id: true, profile: true } }, recipient: { select: { id: true, profile: true } } }, orderBy: { position: 'asc' } }),
     prisma.userBlock.findMany({ where: { blockerId: userId }, select: { blockedUserId: true } })
   ]);
+  if (!getParticipation(participation.id, req.auth!.sessionId, userId, room.id)) return res.status(403).json({ error: 'Participação encerrada. Entre novamente na sala.' });
   const hidden = new Set(blocks.map(block => block.blockedUserId));
-  res.json(messages.reverse().map(message => ({ ...message, blockedForMe: message.scope === 'PUBLIC' && hidden.has(message.userId) })));
+  res.json(messages.map(message => ({ ...roomMessageView(message), participationId: participation.id, blockedForMe: message.scope === 'PUBLIC' && hidden.has(message.userId) })));
 });
 
 apiRouter.get('/blocks', requireAuth, async (req, res) => {
@@ -158,7 +163,10 @@ apiRouter.post('/reports', requireAuth, async (req, res) => {
   const report = await prisma.report.create({ data: { reporterId: req.auth!.userId, reportedUserId, roomMessageId, privateMessageId, reason: cleanText(reason).slice(0, 60), description: typeof description === 'string' ? cleanText(description).slice(0, 500) : null, priority } });
   res.status(201).json(report);
 });
-apiRouter.get('/moderation/reports', requireAuth, requireRole('MODERATOR', 'ADMIN'), async (_req, res) => res.json(await prisma.report.findMany({ include: { reporter: { select: { id: true, profile: true } }, reportedUser: { select: { id: true, profile: true } }, roomMessage: true, privateMessage: true }, orderBy: [{ priority: 'desc' }, { createdAt: 'desc' }] })));
+apiRouter.get('/moderation/reports', requireAuth, requireRole('MODERATOR', 'ADMIN'), async (_req, res) => {
+  const reports = await prisma.report.findMany({ include: { reporter: { select: { id: true, profile: true } }, reportedUser: { select: { id: true, profile: true } }, roomMessage: true, privateMessage: true }, orderBy: [{ priority: 'desc' }, { createdAt: 'desc' }] });
+  res.json(reports.map(report => ({ ...report, roomMessage: report.roomMessage ? roomMessageView(report.roomMessage) : null })));
+});
 apiRouter.patch('/admin/cities/:id', requireAuth, requireRole('ADMIN'), async (req, res) => {
   const city = await prisma.city.update({ where: { id: String(req.params.id) }, data: { active: Boolean(req.body?.active) } });
   await prisma.auditLog.create({ data: { actorUserId: req.auth!.userId, action: 'CITY_STATUS_CHANGED', targetType: 'City', targetId: city.id, metadata: { active: city.active } } }); res.json(city);

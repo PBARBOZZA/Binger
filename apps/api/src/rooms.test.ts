@@ -11,7 +11,7 @@ const db = vi.hoisted(() => {
   return {
     session: { findUnique: vi.fn() }, room: { findFirst: vi.fn(), findMany: vi.fn() },
     user: { findFirst: vi.fn(), findUnique: vi.fn() }, userBlock: { findFirst: vi.fn(), findMany: vi.fn() },
-    $transaction: vi.fn(), $executeRaw: vi.fn(), privateConversation: { findFirst: vi.fn(), create: vi.fn() },
+    $transaction: vi.fn(), $executeRaw: vi.fn(), $queryRaw: vi.fn(), privateConversation: { findFirst: vi.fn(), create: vi.fn() },
     roomMessage: { create: vi.fn(), findMany: vi.fn() }
   };
 });
@@ -30,11 +30,13 @@ let url: string;
 let sockets: Socket[];
 let sessions: Map<string, any>;
 let saved: any[];
+let position: bigint;
 
 beforeEach(async () => {
   vi.clearAllMocks();
   rooms.forEach(room => { room.active = true; room.city.active = true; });
-  sessions = new Map(); saved = []; sockets = [];
+  sessions = new Map(); saved = []; sockets = []; position = 0n;
+  db.$queryRaw.mockImplementation(async () => [{ after: ++position, joinedAt: new Date() }]);
   for (const id of ['a', 'b', 'c']) sessions.set(id, { id, userId: id, expiresAt: new Date(Date.now() + 60_000), revokedAt: null, user: { id, status: 'ACTIVE', profile: { cityId: 'to', nickname: id, ageRange: '25–34' } } });
   db.session.findUnique.mockImplementation(async ({ where }) => where.id ? sessions.get(where.id) : [...sessions.values()].find(session => hash(session.id) === where.tokenHash));
   db.room.findFirst.mockImplementation(async ({ where }) => rooms.find(room => room.active && room.city.active && where.active === true && where.city.active === true && where.OR.some((filter: any) => filter.id === room.id || filter.publicSlug === room.publicSlug)) ?? null);
@@ -48,10 +50,10 @@ beforeEach(async () => {
   db.privateConversation.findFirst.mockResolvedValue(null);
   db.privateConversation.create.mockImplementation(async ({ data }) => ({ ...data, id: 'invitation', status: 'PENDING' }));
   db.roomMessage.create.mockImplementation(async ({ data }) => {
-    const message = { ...data, id: `message-${saved.length}`, createdAt: new Date(), deletedAt: null, moderationStatus: 'VISIBLE' };
+    const message = { ...data, id: `message-${saved.length}`, position: ++position, createdAt: new Date(), deletedAt: null, moderationStatus: 'VISIBLE' };
     saved.push(message); return message;
   });
-  db.roomMessage.findMany.mockImplementation(async ({ where }) => saved.filter(message => message.roomId === where.roomId && message.deletedAt === null && message.moderationStatus === where.moderationStatus && where.OR.some((filter: any) => filter.scope === message.scope || filter.userId === message.userId || filter.recipientId === message.recipientId)));
+  db.roomMessage.findMany.mockImplementation(async ({ where }) => saved.filter(message => message.position > where.position.gt && message.roomId === where.roomId && message.deletedAt === null && message.moderationStatus === where.moderationStatus && where.OR.some((filter: any) => filter.scope === message.scope || filter.userId === message.userId || filter.recipientId === message.recipientId)));
   server = createServer(app); io = new Server(server); configureSocket(io);
   await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
   url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
@@ -68,25 +70,145 @@ async function connect(id: string) {
   return socket;
 }
 const ack = (socket: Socket, event: string, payload: unknown) => socket.timeout(2000).emitWithAck(event, payload);
-async function get(path: string, user = 'a') {
-  return fetch(`${url}/api${path}`, { headers: { cookie: `binger_session=${user}` } });
+async function get(path: string, user = 'a', participationId = '') {
+  return fetch(`${url}/api${path}`, { headers: { cookie: `binger_session=${user}`, 'X-Room-Participation': participationId } });
 }
 // An acknowledged round trip drains earlier frames, avoiding timing-based sleeps.
 const drain = (socket: Socket, room: string) => ack(socket, 'room:join', room);
 
 describe('salas regionais — HTTP e Socket.IO reais com repositório isolado', () => {
-  it('exige autenticação e resolve histórico por ID legado ou slug, sem misturar salas ou reservadas', async () => {
-    saved.push(
-      { id: 'legacy', roomId: 'old-to-id', userId: 'b', recipientId: null, scope: 'PUBLIC', deletedAt: null, moderationStatus: 'VISIBLE' },
-      { id: 'other-city', roomId: 'mucuri-id', userId: 'b', recipientId: null, scope: 'PUBLIC', deletedAt: null, moderationStatus: 'VISIBLE' },
-      { id: 'reserved', roomId: 'old-to-id', userId: 'b', recipientId: 'c', scope: 'RESERVED', deletedAt: null, moderationStatus: 'VISIBLE' }
-    );
+  it('impede que recém-chegados obtenham públicas e reservadas anteriores, inclusive de quem saiu', async () => {
+    const a = await connect('a'), oldC = await connect('c');
+    await ack(a, 'room:join', 'old-to-id');
+    const oldVisit = await ack(oldC, 'room:join', 'old-to-id');
+    await ack(a, 'room:message', { roomId: 'old-to-id', content: 'pública anterior' });
+    await ack(a, 'room:message', { roomId: 'old-to-id', recipientId: 'c', content: 'reservada anterior' });
+    await ack(oldC, 'room:leave', null);
+    expect((await get('/rooms/old-to-id/messages', 'c', oldVisit.participationId)).status).toBe(403);
+    const c = await connect('c');
+    const received = vi.fn(); c.on('room:message:new', received);
+    const visit = await ack(c, 'room:join', 'old-to-id');
+    const read = () => get('/rooms/old-to-id/messages?after=0&joinedAt=1970-01-01', 'c', visit.participationId);
+    expect(await (await read()).json()).toEqual([]);
+    expect(received).not.toHaveBeenCalled();
+    await ack(a, 'room:message', { roomId: 'old-to-id', content: 'pública durante presença' });
+    await ack(a, 'room:message', { roomId: 'old-to-id', recipientId: 'c', content: 'reservada durante presença' });
+    await ack(a, 'room:leave', null);
+    // HTTP round trip follows committed writes; sender presence is not a history filter.
+    const messages = await (await read()).json();
+    expect(messages.map((m: any) => m.content)).toEqual(['pública durante presença', 'reservada durante presença']);
+    expect(received.mock.calls.map(([m]) => m.content)).toEqual(['pública durante presença', 'reservada durante presença']);
+    expect(messages.every((m: any) => m.participationId === visit.participationId && !('position' in m))).toBe(true);
+    saved[2].deletedAt = new Date(); saved[3].moderationStatus = 'HIDDEN';
+    expect(await (await read()).json()).toEqual([]);
+    expect(saved).toHaveLength(4);
+  });
+
+  it('isola ingresso por aba e sessão; troca, saída e reconexão invalidam a janela anterior', async () => {
+    const a = await connect('a'), b = await connect('b');
+    const first = await ack(a, 'room:join', 'old-to-id');
+    await ack(b, 'room:join', 'old-to-id');
+    await ack(b, 'room:message', { roomId: 'old-to-id', content: 'só a primeira aba estava presente' });
+    const secondTab = await connect('a');
+    const second = await ack(secondTab, 'room:join', 'old-to-id');
+    expect(second.participationId).not.toBe(first.participationId);
+    expect(await (await get('/rooms/old-to-id/messages', 'a', second.participationId)).json()).toEqual([]);
+    expect(await (await get('/rooms/old-to-id/messages', 'a', first.participationId)).json()).toHaveLength(1);
+    expect((await get('/rooms/old-to-id/messages', 'b', first.participationId)).status).toBe(403);
+    sessions.set('another-a-session', { ...sessions.get('a'), id: 'another-a-session' });
+    expect((await get('/rooms/old-to-id/messages', 'another-a-session', first.participationId)).status).toBe(403);
+    expect((await get('/rooms/old-to-id/messages', 'a', 'forged')).status).toBe(403);
+    await ack(a, 'room:join', 'mucuri-ba');
+    expect((await get('/rooms/old-to-id/messages', 'a', first.participationId)).status).toBe(403);
+    const back = await ack(a, 'room:join', 'old-to-id');
+    expect(await (await get('/rooms/old-to-id/messages', 'a', back.participationId)).json()).toEqual([]);
+    const serverSocket = io.sockets.sockets.get(a.id!)!;
+    const disconnected = new Promise<void>(resolve => serverSocket.once('disconnect', () => resolve()));
+    a.disconnect(); await disconnected;
+    expect((await get('/rooms/old-to-id/messages', 'a', back.participationId)).status).toBe(403);
+    const reconnected = await connect('a');
+    const fresh = await ack(reconnected, 'room:join', 'old-to-id');
+    expect(fresh.participationId).not.toBe(back.participationId);
+    expect(await (await get('/rooms/old-to-id/messages', 'a', fresh.participationId)).json()).toEqual([]);
+    // A sibling tab's participation remains valid after another tab leaves.
+    expect((await get('/rooms/old-to-id/messages', 'a', second.participationId)).status).toBe(200);
+  });
+
+  it.each(['PUBLIC', 'RESERVED'])('não emite %s antiga cuja entrega terminou depois do novo ingresso, mesmo com timestamp futuro', async scope => {
+    const a = await connect('a'), b = await connect('b');
+    await ack(a, 'room:join', 'old-to-id');
+    await ack(b, 'room:join', 'old-to-id');
+    let release!: () => void;
+    let started!: () => void;
+    const pending = new Promise<void>(resolve => { started = resolve; });
+    const create = db.roomMessage.create.getMockImplementation()!;
+    db.roomMessage.create.mockImplementationOnce(async args => {
+      const message = await create(args);
+      message.createdAt = new Date('2099-01-01');
+      started(); await new Promise<void>(resolve => { release = resolve; });
+      return message;
+    });
+    const send = ack(a, 'room:message', { roomId: 'old-to-id', content: 'entrega atrasada', ...(scope === 'RESERVED' ? { recipientId: 'b' } : {}) });
+    await pending;
+    const received = vi.fn(); b.on('room:message:new', received);
+    const visit = await ack(b, 'room:join', 'old-to-id');
+    release(); await send;
+    expect(await (await get('/rooms/old-to-id/messages', 'b', visit.participationId)).json()).toEqual([]);
+    expect(received).not.toHaveBeenCalled();
+  });
+
+  it('recupera todas as mensagens entre o registro do ingresso e a assinatura Socket.IO', async () => {
+    const b = await connect('b');
+    let release!: () => void;
+    let started!: () => void;
+    const pending = new Promise<void>(resolve => { started = resolve; });
+    db.$queryRaw.mockImplementationOnce(async () => {
+      const boundary = { after: ++position, joinedAt: new Date() };
+      started(); await new Promise<void>(resolve => { release = resolve; });
+      return [boundary];
+    });
+    const join = ack(b, 'room:join', 'old-to-id');
+    await pending;
+    for (let i = 0; i < 60; i++) await db.roomMessage.create({ data: { roomId: 'old-to-id', userId: 'a', scope: 'PUBLIC', content: `durante ingresso ${i}` } });
+    release();
+    const visit = await join;
+    const response = await get('/rooms/old-to-id/messages', 'b', visit.participationId);
+    expect(response.headers.get('cache-control')).toBe('no-store');
+    const messages = await response.json();
+    expect(messages).toHaveLength(60);
+    expect(new Set(messages.map((m: any) => m.id)).size).toBe(60);
+  });
+
+  it('recusa resposta HTTP em voo quando a participação foi encerrada durante a consulta', async () => {
+    const a = await connect('a');
+    const visit = await ack(a, 'room:join', 'old-to-id');
+    let release!: () => void;
+    let started!: () => void;
+    const pending = new Promise<void>(resolve => { started = resolve; });
+    db.roomMessage.findMany.mockImplementationOnce(async () => {
+      started(); await new Promise<void>(resolve => { release = resolve; }); return [];
+    });
+    const response = get('/rooms/old-to-id/messages', 'a', visit.participationId);
+    await pending;
+    await ack(a, 'room:leave', null);
+    release();
+    expect((await response).status).toBe(403);
+  });
+
+  it('recusa histórico sem ingresso e datas forjadas; resolve o endereço pelo ID original', async () => {
     expect((await fetch(`${url}/api/rooms`)).status).toBe(401);
-    expect((await get('/rooms')).status).toBe(200);
+    const catalog = await (await get('/rooms')).json();
+    expect(catalog.map((room: any) => room.id)).toEqual(['old-to-id', 'mucuri-id']);
+    expect(catalog[0].slug).toBe('teofilo-otoni-mg');
     for (const reference of ['old-to-id', 'teofilo-otoni-mg']) {
-      expect((await (await get(`/rooms/${reference}/messages`)).json()).map((message: any) => message.id)).toEqual(['legacy']);
+      expect((await get(`/rooms/${reference}/messages?joinedAt=1970-01-01&after=0`)).status).toBe(403);
     }
-    expect((await (await get('/rooms/mucuri-ba/messages')).json()).map((message: any) => message.id)).toEqual(['other-city']);
+    const a = await connect('a');
+    expect(await ack(a, 'room:join', { roomId: 'old-to-id', joinedAt: '1970-01-01' })).toHaveProperty('error');
+    const joined = await ack(a, 'room:join', 'teofilo-otoni-mg');
+    expect(joined).toMatchObject({ ok: true, roomId: 'old-to-id', participationId: expect.any(String), joinedAt: expect.any(String) });
+    for (const reference of ['old-to-id', 'teofilo-otoni-mg']) expect(await (await get(`/rooms/${reference}/messages`, 'a', joined.participationId)).json()).toEqual([]);
+    expect((await get('/rooms/mucuri-ba/messages', 'a', joined.participationId)).status).toBe(403);
     expect((await get('/rooms/unknown/messages')).status).toBe(404);
     rooms[1]!.city.active = false;
     expect((await get('/rooms/mucuri-ba/messages')).status).toBe(404);

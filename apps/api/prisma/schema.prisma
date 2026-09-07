@@ -136,6 +136,7 @@ model UserProfile {
 
 model RoomMessage {
   id String @id @default(cuid())
+  position BigInt @default(autoincrement())
   roomId String
   room Room @relation(fields: [roomId], references: [id])
   userId String
@@ -149,6 +150,7 @@ model RoomMessage {
   moderationStatus ModerationStatus @default(VISIBLE)
   reports Report[]
   @@index([roomId, createdAt])
+  @@index([roomId, position])
   @@index([recipientId, createdAt])
 }
 

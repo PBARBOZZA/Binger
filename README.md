@@ -62,7 +62,8 @@ Redis para presença e limites, fila durável de e-mail, exportação/exclusão 
 - [ ] Todos os segredos e credenciais foram rotacionados.
 - [ ] Entrega transacional de e-mail validada no ambiente de produção.
 - [ ] HTTPS, cookies Secure, CORS e CSP apontam somente ao domínio final.
-- [ ] Migrations e seed executados; administrador acessível e senha trocada.
+- [ ] Migrations aplicadas conforme [ensaio e correção regional](docs/regional-rooms.md); seed opcional validado sem reativar duplicatas; administrador acessível e senha trocada.
+- [ ] ID, slug e mensagens da sala original preservados; API e frontend da mesma revisão; privacidade por ingresso conferida em HTTP, Socket.IO e múltiplas abas.
 - [ ] Backup e restauração testados.
 - [ ] Termos, Privacidade e retenção revisados juridicamente.
 - [ ] Moderação, canal de denúncia e resposta a incidentes definidos.
